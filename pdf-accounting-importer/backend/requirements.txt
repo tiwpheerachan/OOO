@@ -1,20 +1,15 @@
-# --- Web framework ---
-fastapi==0.110.0
-uvicorn==0.27.1
-python-multipart==0.0.9
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
 
-# --- PDF / Image ---
-pymupdf==1.23.26
-pdfplumber==0.10.4
-pillow==10.2.0
+openai==1.40.6
+
+pymupdf==1.24.9
+pdfplumber==0.11.4
+pillow==10.4.0
 numpy==1.26.4
 
-# --- OCR (CPU only) ---
-paddleocr==2.7.0.3
-paddlepaddle==2.5.2
+# OCR (หนักมากบน free tier)
+paddleocr==2.7.3
+paddlepaddle==2.6.2
 
-# --- Image processing (เบากว่า contrib) ---
-opencv-python-headless==4.9.0.80
-
-# --- AI ---
-openai>=1.12.0
+opencv-contrib-python==4.10.0.84
