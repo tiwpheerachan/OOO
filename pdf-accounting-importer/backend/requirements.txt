@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pymupdf
+pdfplumber
+pillow
+numpy
+paddleocr
+paddlepaddle
+opencv-contrib-python

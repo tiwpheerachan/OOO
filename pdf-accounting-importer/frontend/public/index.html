@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>PDF Accounting Importer — PEAK A–U</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar glass">
+      <div class="brand">
+        <div class="logoBox">
+          <img
+            class="logoImg"
+            src="https://i.pinimg.com/originals/1c/04/fe/1c04fe65a2b621a487f8f43e5fc80b5c.gif"
+            alt="Logo"
+            loading="lazy"
+            referrerpolicy="no-referrer"
+          />
+        </div>
+        <div class="brandText">
+          <div class="title">PDF Accounting Importer</div>
+          <div class="sub">PEAK A–U · Realtime Progress + Edit + History</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="h">Backend URL</div>
+        <div class="field">
+          <label>เชื่อมต่อ API</label>
+          <input id="backendUrl" placeholder="http://localhost:8000" />
+        </div>
+        <div class="muted small" style="margin-top:8px">
+          * ถ้าใช้ Docker: backend = http://localhost:8000
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="h">1) Upload Files</div>
+
+        <div id="drop" class="drop">
+          <div class="dropInner">
+            <div class="big">ลากไฟล์มาวาง</div>
+            <div class="hint">รองรับ PDF และรูปภาพ · หลายร้อยไฟล์ได้</div>
+            <input id="file" type="file" multiple style="display:none" accept=".pdf,image/*" />
+            <div class="row">
+              <button class="btn" id="btnPick">เลือกไฟล์</button>
+              <button id="btnClear" class="btn danger" disabled>ล้าง</button>
+            </div>
+            <div id="uploadInfo" class="muted small">ยังไม่ได้เลือกไฟล์</div>
+          </div>
+        </div>
+
+        <div class="row" style="margin-top:12px">
+          <button id="btnUpload" class="btn primary" disabled>อัปโหลด & ประมวลผล</button>
+          <button id="btnHistory" class="btn">ประวัติ</button>
+        </div>
+
+        <div class="hintbar small muted" style="margin-top:10px">
+          PDF แบบสแกน/รูป: ตอนนี้จะเป็น <b>Needs review</b> (ยังไม่ทำ OCR)
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="h">2) Realtime Progress</div>
+
+        <!-- ✅ NEW layout: ring centered + KPI in one column (each on its own row) -->
+        <div class="progressWrapV2">
+          <div class="ringBlock">
+            <div class="ring" id="ring" style="--p:0">
+              <div class="ringInner">
+                <div class="ringPct" id="progressPct">0%</div>
+                <div class="ringSub muted small" id="jobState">—</div>
+              </div>
+            </div>
+
+            <div class="ringLegend">
+              <span class="dot d1"></span><span class="muted small">Done</span>
+              <span class="dot d2"></span><span class="muted small">OK</span>
+              <span class="dot d3"></span><span class="muted small">Review</span>
+            </div>
+          </div>
+
+          <div class="kpisV2">
+            <div class="kpiRow">
+              <div class="kpiLeft">
+                <div class="kpiLabel">กำลังทำ</div>
+                <div class="kpiValue" id="kpiInWork">—</div>
+              </div>
+              <div class="kpiMini muted small" id="kpiMiniFiles">—</div>
+            </div>
+
+            <div class="kpiRow">
+              <div class="kpiLeft">
+                <div class="kpiLabel">สำเร็จ</div>
+                <div class="kpiValue" id="kpiOk">0</div>
+              </div>
+              <div class="pill ok">OK</div>
+            </div>
+
+            <div class="kpiRow">
+              <div class="kpiLeft">
+                <div class="kpiLabel">ตรวจ</div>
+                <div class="kpiValue" id="kpiReview">0</div>
+              </div>
+              <div class="pill review">Needs review</div>
+            </div>
+
+            <div class="progressLine">
+              <div class="bar">
+                <div class="barFill" id="barFill" style="width:0%"></div>
+              </div>
+              <div class="muted small" id="jobMeta">—</div>
+              <div class="muted small" id="queueHint">—</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="queueTitle">
+          <span class="muted small">Queue</span>
+        </div>
+
+        <div class="queue" id="queue" style="margin-top:10px">
+          <div class="muted small">ยังไม่มีงาน</div>
+        </div>
+      </div>
+
+      <div class="footer muted small">
+        v3 UI · Rainbow Ring · Excel Grid · Inline Edit + Export
+      </div>
+    </aside>
+
+    <main class="main">
+      <div class="topbar">
+        <div>
+          <div class="pageTitle">ผลลัพธ์ (PEAK Import)</div>
+          <div class="muted small">Filter + Search + Export CSV/XLSX · แก้ไขได้</div>
+        </div>
+
+        <div class="actions">
+          <button id="btnEdit" class="btn">แก้ไข</button>
+          <button id="btnSave" class="btn primary" disabled>บันทึก</button>
+
+          <div class="sep"></div>
+
+          <button id="btnCsv" class="btn" disabled>ดาวน์โหลด CSV (backend)</button>
+          <button id="btnXlsx" class="btn" disabled>ดาวน์โหลด XLSX (backend)</button>
+
+          <button id="btnCsvEdited" class="btn" disabled>CSV (แก้ไขแล้ว)</button>
+          <button id="btnXlsxEdited" class="btn" disabled>XLSX (แก้ไขแล้ว)</button>
+        </div>
+      </div>
+
+      <section class="panel glass">
+        <div class="panelHead">
+          <div class="filters">
+            <button class="chip active" data-filter="all">ทั้งหมด</button>
+            <button class="chip" data-filter="OK">OK</button>
+            <button class="chip" data-filter="NEEDS_REVIEW">Needs review</button>
+          </div>
+          <div class="search">
+            <input id="q" placeholder="ค้นหา… (invoice, tax id, amount)" />
+          </div>
+        </div>
+
+        <!-- ✅ table area -->
+        <div class="tableWrap" id="tableWrap">
+          <table class="excel" id="resultTable">
+            <thead id="thead"></thead>
+            <tbody id="tbody"></tbody>
+          </table>
+        </div>
+
+        <div class="hintbar small muted">
+          Tip: ข้อความยาวจะเลื่อนแนวนอนได้เหมือน Excel · กด “แก้ไข” เพื่อปรับค่า แล้ว “บันทึก” เพื่อ Export
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- History Modal -->
+  <div class="modal" id="historyModal" aria-hidden="true">
+    <div class="modalBackdrop" data-close="1"></div>
+    <div class="modalCard glass" role="dialog" aria-modal="true" aria-label="History">
+      <div class="modalHead">
+        <div>
+          <div class="modalTitle">ประวัติงาน (History)</div>
+          <div class="muted small">เก็บไว้ในเครื่อง (localStorage) · กด “โหลด” เพื่อดูข้อมูลย้อนหลัง</div>
+        </div>
+        <button class="btn" data-close="1">ปิด</button>
+      </div>
+
+      <div class="modalBody">
+        <div class="historyToolbar">
+          <button class="btn danger" id="btnClearHistory">ล้างประวัติ</button>
+          <div class="muted small" id="historyCount">—</div>
+        </div>
+        <div class="historyList" id="historyList"></div>
+        <div class="hintbar small muted" style="margin-top:10px">
+          หมายเหตุ: ถ้า backend ลบงานเก่าแล้ว อาจ “โหลด” ไม่ได้ (job expired) แต่ประวัติยังอยู่
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="./app.js"></script>
+</body>
+</html>

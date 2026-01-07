@@ -1,0 +1,17 @@
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTHONUNBUFFERED=1
+
+  frontend:
+    image: nginx:alpine
+    volumes:
+      - ./frontend/public:/usr/share/nginx/html:ro
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
