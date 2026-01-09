@@ -1,60 +1,43 @@
+# backend/app/extractors/tiktok.py
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict
 
 from ..utils.text_utils import normalize_text
 
 # -------------------------------------------------------------------
 # TikTok invoice patterns (best-effort, robust)
-# Goals (FIX):
-# 1) Separate amounts clearly:
-#    - total_ex_vat
-#    - vat_amount
-#    - total_inc_vat (PRIMARY)
-#    - wht_amount_3pct
-# 2) Mapping MUST be:
-#    row["N_unit_price"]  = total_inc_vat
-#    row["R_paid_amount"] = total_inc_vat
-#    row["O_vat_rate"]    = "7%"
-#    row["P_wht"]         = "3%"
-# 3) NEVER put wht_amount into unit_price/paid_amount
+# FIX LIST:
+# ✅ C_reference / G_invoice_no: remove ALL whitespace/newlines (glue tokens)
+# ✅ P_wht: MUST be "" always (your latest requirement)
+# ✅ Never map WHT amount into N_unit_price/R_paid_amount
+# ✅ Keep totals separation
 # -------------------------------------------------------------------
 
 RE_TTSTH = re.compile(r"\bTTSTH\d{8,}\b", re.IGNORECASE)
 
-# Prefer vendor tax id line explicitly
+# vendor tax
 RE_VENDOR_TAX_LINE = re.compile(
     r"(tax\s*registration\s*number)\s*[:：\-]?\s*(\d{13})",
     re.IGNORECASE,
 )
-
-# Client/Buyer tax id line (Bill To / Tax ID) - used only to avoid picking client's id
-RE_CLIENT_TAX_LINE = re.compile(
-    r"\bTax\s*ID\s*[:：\-]?\s*(\d{13})\b",
-    re.IGNORECASE,
-)
-
 RE_TAX_ID_13_ANY = re.compile(r"\b\d{13}\b")
 
-# Branch (00000 / 5 digits)
+# branch
 RE_BRANCH_5 = re.compile(r"(branch|สาขา)\s*[:\-]?\s*(\d{1,5})", re.IGNORECASE)
 
-# Dates
-RE_DATE_ANY = re.compile(r"\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b")  # YYYY-MM-DD or YYYY/MM/DD
+# dates
+RE_DATE_ANY = re.compile(r"\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b")
 RE_INVOICE_DATE_LINE = re.compile(r"(invoice\s*date)\s*[:：\-]?\s*(.+)", re.IGNORECASE)
 RE_DOC_DATE_LINE = re.compile(r"(document\s*date|วันที่เอกสาร)\s*[:：\-]?\s*(.+)", re.IGNORECASE)
-
-# TikTok commonly shows "Dec 9, 2025"
 RE_DATE_MON_DD_YYYY = re.compile(
     r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2}),\s*(\d{4})\b",
     re.IGNORECASE,
 )
 
-# Amounts
+# money
 RE_MONEY = re.compile(r"(-?\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?|-?\d+(?:\.\d{1,2})?)")
-
-# TikTok totals keywords (more robust)
 RE_TOTAL_INCL = re.compile(
     r"(total\s*amount.*including\s*vat|total\s*amount\s*\(including\s*vat\)|amount\s*due|grand\s*total)",
     re.IGNORECASE,
@@ -62,24 +45,32 @@ RE_TOTAL_INCL = re.compile(
 RE_TOTAL_VAT = re.compile(r"(total\s*vat|vat\s*amount|value\s*added\s*tax)", re.IGNORECASE)
 RE_SUBTOTAL_EXCL = re.compile(r"(subtotal.*excluding\s*vat|total.*excluding\s*vat|subtotal\s*\(excluding\s*vat\))", re.IGNORECASE)
 
-# Withholding tax (WHT)
-# Example: "withheld tax at the rate of 3%, amounting to ฿4,414.88"
+# WHT
 RE_WHT_AMOUNTING = re.compile(
     r"(withheld\s*tax|withholding\s*tax).*?rate\s*of\s*(\d{1,2})\s*%.*?amounting\s*to\s*฿?\s*([0-9,]+(?:\.[0-9]{1,2})?)",
     re.IGNORECASE | re.DOTALL,
 )
-
-# Sometimes written differently
 RE_WHT_GENERIC = re.compile(
     r"(withheld|withholding|wht).*?(\d{1,2})\s*%.*?(?:฿|THB)?\s*([0-9,]+(?:\.[0-9]{1,2})?)",
     re.IGNORECASE | re.DOTALL,
 )
-
-# Exclude picking numbers from WHT chunks when searching totals
 RE_WHT_HINT = re.compile(r"(withheld\s*tax|withholding\s*tax|wht)", re.IGNORECASE)
 
-# Optional ads/fee hints (keep simple)
 RE_ADS_HINT = re.compile(r"\b(ads|advertising|promotion|โฆษณา|ค่าโฆษณา)\b", re.IGNORECASE)
+
+# ✅ remove all whitespace for reference/invoice glue
+RE_ALL_WS = re.compile(r"\s+")
+
+# ✅ Sometimes TikTok shows invoice/reference split across lines without TTSTH pattern.
+# Catch "Invoice No" / "Invoice Number" / "Reference" blocks, then glue
+RE_INVOICE_NO_LINE = re.compile(
+    r"(invoice\s*(?:no|number)|reference|ref\.?)\s*[:：#\-]?\s*([A-Za-z0-9][A-Za-z0-9\-\_\/]{6,})",
+    re.IGNORECASE,
+)
+
+# ✅ Fallback: capture tokens like RCSPXSPB00-00000-25 then next token 1218-0001593 (may be newline)
+RE_REF_TOKEN_1 = re.compile(r"\b([A-Z]{2,}[A-Z0-9]*\d{2,}[A-Z0-9\-]{6,})\b")
+RE_REF_TOKEN_2 = re.compile(r"\b(\d{2,4}-\d{5,})\b")
 
 
 def _clean_digits(s: Any, max_len: int | None = None) -> str:
@@ -89,6 +80,15 @@ def _clean_digits(s: Any, max_len: int | None = None) -> str:
     if max_len is not None:
         out = out[:max_len]
     return out
+
+
+def _compact_ref(v: Any) -> str:
+    """Remove ALL whitespace to glue tokens across lines/spaces."""
+    s = "" if v is None else str(v)
+    s = s.strip()
+    if not s:
+        return ""
+    return RE_ALL_WS.sub("", s)
 
 
 def _money_to_str(v: str) -> str:
@@ -105,11 +105,6 @@ def _money_to_str(v: str) -> str:
 
 
 def _to_yyyymmdd_from_text(s: str) -> str:
-    """
-    Support:
-    - YYYY-MM-DD / YYYY/MM/DD
-    - 'Dec 9, 2025'
-    """
     if not s:
         return ""
 
@@ -135,10 +130,6 @@ def _to_yyyymmdd_from_text(s: str) -> str:
 
 
 def _find_amount_near_keyword_excluding(text: str, keyword_re: re.Pattern, window: int = 240) -> str:
-    """
-    Find amount near keyword BUT avoid chunks that are clearly about WHT.
-    Picks the last number (right side) in the chunk.
-    """
     if not text:
         return ""
     m = keyword_re.search(text)
@@ -149,7 +140,7 @@ def _find_amount_near_keyword_excluding(text: str, keyword_re: re.Pattern, windo
     end = min(len(text), m.end() + window)
     chunk = text[start:end]
 
-    # If chunk contains WHT hint, try to cut the chunk before WHT hint to avoid picking wht amount
+    # avoid wht in chunk
     w = RE_WHT_HINT.search(chunk)
     if w:
         chunk = chunk[: w.start()]
@@ -162,8 +153,8 @@ def _find_amount_near_keyword_excluding(text: str, keyword_re: re.Pattern, windo
 
 def _extract_wht_amount_3pct(text: str) -> str:
     """
-    Extract WHT amount (3%) only. Returns money string like '4414.88' or ''.
-    This MUST NOT be mapped into unit_price/paid_amount.
+    Extract WHT amount (3%) ONLY for internal logic (NOT for PEAK column P_wht).
+    Returns numeric string like '4414.88' or ''.
     """
     if not text:
         return ""
@@ -186,42 +177,71 @@ def _extract_wht_amount_3pct(text: str) -> str:
 
 
 def _blank_row() -> Dict[str, Any]:
-    """
-    Baseline defaults for PEAK (aligned with your pipeline).
-    Note: D_vendor_code is a platform label here; extract_service/vendor_mapping will convert to Cxxxxx.
-    """
     return {
         "B_doc_date": "",
         "C_reference": "",
         "D_vendor_code": "TikTok",
-        "E_tax_id_13": "",      # vendor tax id
+        "E_tax_id_13": "",
         "F_branch_5": "00000",
         "G_invoice_no": "",
         "H_invoice_date": "",
         "I_tax_purchase_date": "",
-        "J_price_type": "1",    # VAT separated
+        "J_price_type": "1",
         "K_account": "",
         "L_description": "",
         "M_qty": "1",
         "N_unit_price": "0",
         "O_vat_rate": "7%",
-        "P_wht": "0",           # we will set to "3%" if WHT exists (per your requirement)
+        "P_wht": "",              # ✅ MUST be blank always
         "Q_payment_method": "",
         "R_paid_amount": "0",
         "S_pnd": "",
-        "T_note": "",           # ✅ must stay empty
+        "T_note": "",
         "U_group": "Marketplace Expense",
     }
 
 
+def _extract_reference_invoice_glued(t: str) -> str:
+    """
+    Best-effort:
+    1) TTSTH...
+    2) Invoice No / Reference: <token>
+    3) Glue token-1 + token-2 if appears split (RC... + 1218-....)
+    Return compacted (no whitespace).
+    """
+    if not t:
+        return ""
+
+    m = RE_TTSTH.search(t)
+    if m:
+        return _compact_ref(m.group(0))
+
+    # invoice number line
+    m2 = RE_INVOICE_NO_LINE.search(t)
+    if m2:
+        return _compact_ref(m2.group(2))
+
+    # split tokens: find a "prefix-like" token then a "1218-xxxx"
+    # Use a small window to avoid random pairing
+    m3 = RE_REF_TOKEN_1.search(t)
+    if m3:
+        start = m3.end()
+        window = t[start : min(len(t), start + 120)]
+        m4 = RE_REF_TOKEN_2.search(window)
+        if m4:
+            return _compact_ref(m3.group(1) + m4.group(1))
+        return _compact_ref(m3.group(1))
+
+    return ""
+
+
 def extract_tiktok(text: str, client_tax_id: str = "") -> Dict[str, Any]:
     """
-    TikTok extractor (rule-based) - FIXED for:
-    - Use Total Included VAT as primary
-    - Separate total_ex_vat / vat_amount / total_inc_vat / wht_amount_3pct
-    - Never let WHT amount pollute N_unit_price / R_paid_amount
-    - P_wht is "3%" (rate) when found, else "0"
-    - T_note always empty
+    TikTok extractor (rule-based) - hardened for:
+    ✅ C_reference/G_invoice_no glued (no whitespace, even cross-line)
+    ✅ P_wht blank always
+    ✅ totals separation and mapping to total_inc_vat only
+    ✅ T_note empty
     """
     t = normalize_text(text or "")
     row = _blank_row()
@@ -229,10 +249,9 @@ def extract_tiktok(text: str, client_tax_id: str = "") -> Dict[str, Any]:
     if not t.strip():
         return row
 
-    # --- Reference / invoice no ---
-    tt = RE_TTSTH.search(t)
-    if tt:
-        ref = tt.group(0).strip()
+    # --- Reference / invoice no (glued) ---
+    ref = _extract_reference_invoice_glued(t)
+    if ref:
         row["C_reference"] = ref
         row["G_invoice_no"] = ref
 
@@ -242,7 +261,7 @@ def extract_tiktok(text: str, client_tax_id: str = "") -> Dict[str, Any]:
     if m_vendor:
         vendor_tax = _clean_digits(m_vendor.group(2), 13)
 
-    # Avoid choosing client's tax id as vendor tax id
+    # Avoid choosing client's tax id
     ctax = _clean_digits(client_tax_id, 13) if client_tax_id else ""
     if not vendor_tax:
         all_tax = RE_TAX_ID_13_ANY.findall(t)
@@ -278,48 +297,48 @@ def extract_tiktok(text: str, client_tax_id: str = "") -> Dict[str, Any]:
     row["B_doc_date"] = inv_date
     row["I_tax_purchase_date"] = inv_date
 
-    # =========================================================
-    # Amount separation (STRICT)
-    # =========================================================
+    # --- Amount separation ---
     total_ex_vat = _find_amount_near_keyword_excluding(t, RE_SUBTOTAL_EXCL)
     vat_amount = _find_amount_near_keyword_excluding(t, RE_TOTAL_VAT)
     total_inc_vat = _find_amount_near_keyword_excluding(t, RE_TOTAL_INCL)
 
-    # WHT amount 3% (do NOT map to totals)
-    wht_amount_3pct = _extract_wht_amount_3pct(t)
+    # WHT amount (internal only)
+    _wht_amount_3pct = _extract_wht_amount_3pct(t)
 
-    # Derive total_inc_vat if missing but subtotal+vat exist
+    # Derive total_inc_vat
     if (not total_inc_vat) and total_ex_vat and vat_amount:
         try:
             total_inc_vat = f"{(float(total_ex_vat) + float(vat_amount)):.2f}"
         except Exception:
             pass
-
-    # Fallback: if still no total_inc_vat, use total_ex_vat (better than 0, still not WHT)
     if not total_inc_vat and total_ex_vat:
         total_inc_vat = total_ex_vat
 
-    # =========================================================
-    # Mapping (per your strict requirement)
-    # =========================================================
+    # Mapping totals (NEVER use WHT)
     if total_inc_vat:
         row["N_unit_price"] = total_inc_vat
         row["R_paid_amount"] = total_inc_vat
 
-    # VAT columns (always 7% in this TikTok flow per your rule)
+    # VAT rules
     row["J_price_type"] = "1"
     row["O_vat_rate"] = "7%"
 
-    # WHT column: rate only "3%" (if found), else "0"
-    row["P_wht"] = "3%" if wht_amount_3pct else "0"
-    if wht_amount_3pct:
-        row["S_pnd"] = "53"
+    # ✅ P_wht must be blank always
+    row["P_wht"] = ""
 
-    # --- Description / Group (keep stable) ---
+    # Description/group
     row["U_group"] = "Marketplace Expense"
     row["L_description"] = "Advertising Expense" if RE_ADS_HINT.search(t) else "Marketplace Expense"
 
-    # ✅ T_note must be empty always
+    # ✅ T_note empty
     row["T_note"] = ""
+
+    # ✅ hard compact again for safety
+    row["C_reference"] = _compact_ref(row.get("C_reference"))
+    row["G_invoice_no"] = _compact_ref(row.get("G_invoice_no"))
+    if not row["C_reference"] and row["G_invoice_no"]:
+        row["C_reference"] = row["G_invoice_no"]
+    if not row["G_invoice_no"] and row["C_reference"]:
+        row["G_invoice_no"] = row["C_reference"]
 
     return row

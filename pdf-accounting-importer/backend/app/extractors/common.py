@@ -1,22 +1,28 @@
+# backend/app/extractors/common.py
 """
 Common utilities and patterns for invoice extraction
 Enhanced with AI-ready patterns for better accuracy
-Version 3.2 - Line-aware + Full Reference Number Support
+Version 3.2.1 - Line-aware + Full Reference Number Support + No-space Reference + WHT-safe
 
 ⭐ Key upgrades (สำคัญมาก)
 1) normalize_text() "รักษา newline" เพื่อให้ regex แบบ MULTILINE (^ / $) ใช้งานได้จริง
-   - เดิมคุณบีบ whitespace เป็นช่องว่างเดียว ทำให้พวกตาราง/บรรทัดใน PDF พังหมด
 2) find_best_date() ฉลาดขึ้น: ให้คะแนนวันที่ที่อยู่ใกล้คำว่า Invoice/Tax Invoice/Receipt/วันที่/Issue date
 3) extract_amounts() ฉลาดขึ้น: เก็บหลาย candidate แล้วเลือกอันที่ “เหมาะสมสุด”
-   - ลดการหยิบยอดผิดจากบรรทัดอื่น ๆ
+   + ✅ anti-WHT pollution: ไม่เลือกยอดรวมที่อยู่ใกล้คำว่า WHT/หักภาษี
 4) find_vendor_tax_id() กันหลุด: เลือกเลขที่อยู่ใกล้ชื่อ platform + กัน client tax id ของ Rabbit/SHD/TopOne
-5) find_invoice_no() แข็งแรงขึ้น: จับ “เอกสาร + reference” ได้ดีขึ้น + กัน false positive
+5) find_invoice_no() แข็งแรงขึ้น:
+   - จับ “เอกสาร + reference” ได้ดีขึ้นแม้ OCR แยกข้ามบรรทัด
+   - ✅ รองรับ "MMDD - NNNNNNN" (space around dash)
+   - ✅ มี helper บังคับ "no-space reference" ให้ทุก extractor ใช้ได้
+6) format_peak_row():
+   - ✅ P_wht เป็น "rate-only" (เช่น "3%") ตาม requirement ล่าสุด
+   - ❌ ไม่คำนวณจำนวนเงินจาก rate ไปทับ P_wht อีกต่อไป
 """
 
 from __future__ import annotations
 
 import re
-from typing import Dict, Any, Tuple, List
+from typing import Dict, Any, Tuple, List, Optional
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
@@ -33,6 +39,27 @@ _ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\ufeff]")
 _WS_INLINE_RE = re.compile(r"[ \t\f\v]+")
 _WS_MANY_NL_RE = re.compile(r"\n{3,}")
 
+# Reference cleanup
+_WS_ANY_RE = re.compile(r"\s+")
+
+def squash_all_ws(text: str) -> str:
+    """Remove ALL whitespace (space/newline/tab) - used for strict reference outputs."""
+    if not text:
+        return ""
+    return _WS_ANY_RE.sub("", str(text))
+
+def normalize_reference_no_space(ref: str) -> str:
+    """
+    Normalize reference/invoice number to strict no-space format.
+    - remove all whitespace
+    - trim quote/punct tails
+    """
+    if not ref:
+        return ""
+    s = str(ref).strip().strip('"').strip("'")
+    s = squash_all_ws(s)
+    s = re.sub(r"[,\.;:]+$", "", s)
+    return s
 
 def normalize_text(text: str) -> str:
     """
@@ -55,7 +82,7 @@ def normalize_text(text: str) -> str:
     s = _ZERO_WIDTH_RE.sub("", s)
 
     # Normalize spaces inside each line (keep line structure)
-    lines = []
+    lines: List[str] = []
     for line in s.split("\n"):
         line = _WS_INLINE_RE.sub(" ", line).strip()
         lines.append(line)
@@ -63,7 +90,6 @@ def normalize_text(text: str) -> str:
     s = "\n".join(lines).strip()
     s = _WS_MANY_NL_RE.sub("\n\n", s)  # prevent insane blank pages
     return s
-
 
 def normalize_one_line(text: str) -> str:
     """
@@ -75,14 +101,12 @@ def normalize_one_line(text: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s.strip()
 
-
 def fmt_tax_13(raw: str) -> str:
     """Format to 13-digit tax ID (0105561071873)"""
     if not raw:
         return ""
     digits = re.sub(r"\D", "", str(raw))
     return digits if len(digits) == 13 else ""
-
 
 def fmt_branch_5(raw: str) -> str:
     """Format to 5-digit branch code (00000)"""
@@ -92,7 +116,6 @@ def fmt_branch_5(raw: str) -> str:
     if digits == "":
         return "00000"
     return digits.zfill(5)[:5]
-
 
 def parse_date_to_yyyymmdd(date_str: str) -> str:
     """
@@ -128,7 +151,6 @@ def parse_date_to_yyyymmdd(date_str: str) -> str:
 
     return ""
 
-
 def parse_en_date(date_str: str) -> str:
     """Parse English date formats like 'Dec 9, 2025' to YYYYMMDD"""
     if not date_str:
@@ -152,7 +174,6 @@ def parse_en_date(date_str: str) -> str:
             continue
 
     return ""
-
 
 def parse_money(value: str) -> str:
     """
@@ -179,6 +200,11 @@ def parse_money(value: str) -> str:
     except (InvalidOperation, ValueError):
         return ""
 
+def safe_decimal(s: str) -> Decimal:
+    try:
+        return Decimal(str(s).replace(",", "").strip())
+    except Exception:
+        return Decimal("0")
 
 # ============================================================
 # Core patterns (enhanced with full reference support)
@@ -206,16 +232,20 @@ RE_DATE_EN = re.compile(
 # ============================================================
 
 # Full reference pattern with document number + reference code
+# ✅ allow whitespace/newline between
+# ✅ allow spaces around dash in reference
 # Examples:
 #   TRSPEMKP00-00000-25 1203-0012589
 #   RCSPXSPB00-00000-25 1205-0012345
+#   RCSPXSPB00-00000-25 1205 - 0012345
 RE_INVOICE_WITH_REF = re.compile(
-    r"\b([A-Z]{2,}[A-Z0-9\-/_.]{6,})\s+(\d{4}-\d{6,9})\b",
+    r"\b([A-Z]{2,}[A-Z0-9\-/_.]{6,})\s+(\d{4})\s*-\s*(\d{6,9})\b",
     re.IGNORECASE
 )
 
+# More tolerant long ref patterns like "25/0012345678" or "2512-0001593"
 RE_INVOICE_WITH_LONG_REF = re.compile(
-    r"\b([A-Z]{2,}[A-Z0-9\-/_.]{6,})\s+(\d{2,4}[-/]\d{6,10})\b",
+    r"\b([A-Z]{2,}[A-Z0-9\-/_.]{6,})\s+(\d{2,4})\s*[-/]\s*(\d{6,10})\b",
     re.IGNORECASE
 )
 
@@ -227,14 +257,14 @@ RE_INVOICE_GENERIC = re.compile(
 
 # Platform-specific doc patterns
 RE_SPX_DOC = re.compile(r"\b(RCS[A-Z0-9\-/]{10,})\b", re.IGNORECASE)
-RE_SPX_DOC_WITH_REF = re.compile(r"\b(RCS[A-Z0-9\-/]{10,})\s+(\d{4}-\d{7})\b", re.IGNORECASE)
+RE_SPX_DOC_WITH_REF = re.compile(r"\b(RCS[A-Z0-9\-/]{10,})\s+(\d{4})\s*-\s*(\d{7})\b", re.IGNORECASE)
 
 RE_SHOPEE_DOC = re.compile(
     r"\b((?:Shopee-)?TI[VR]-[A-Z0-9]+-\d{5}-\d{6}-\d{7,}|TRS[A-Z0-9\-_/]{8,})\b",
     re.IGNORECASE
 )
 RE_SHOPEE_DOC_WITH_REF = re.compile(
-    r"\b((?:Shopee-)?TI[VR]-[A-Z0-9]+-\d{5}-\d{6}-\d{7,}|TRS[A-Z0-9\-_/]{8,})\s+(\d{4}-\d{7})\b",
+    r"\b((?:Shopee-)?TI[VR]-[A-Z0-9]+-\d{5}-\d{6}-\d{7,}|TRS[A-Z0-9\-_/]{8,})\s+(\d{4})\s*-\s*(\d{7})\b",
     re.IGNORECASE
 )
 
@@ -243,15 +273,15 @@ RE_LAZADA_DOC = re.compile(
     re.IGNORECASE
 )
 RE_LAZADA_DOC_WITH_REF = re.compile(
-    r"\b(THMPTI\d{16}|(?:LAZ|LZD)[A-Z0-9\-_/.]{6,})\s+(\d{4}-\d{7})\b",
+    r"\b(THMPTI\d{16}|(?:LAZ|LZD)[A-Z0-9\-_/.]{6,})\s+(\d{4})\s*-\s*(\d{7})\b",
     re.IGNORECASE
 )
 
 RE_TIKTOK_DOC = re.compile(r"\b(TTSTH\d{14,})\b", re.IGNORECASE)
-RE_TIKTOK_DOC_WITH_REF = re.compile(r"\b(TTSTH\d{14,})\s+(\d{4}-\d{7})\b", re.IGNORECASE)
+RE_TIKTOK_DOC_WITH_REF = re.compile(r"\b(TTSTH\d{14,})\s+(\d{4})\s*-\s*(\d{7})\b", re.IGNORECASE)
 
-# Standalone reference code
-RE_REFERENCE_CODE = re.compile(r"\b(\d{4}-\d{6,9})\b")
+# Standalone reference code (allow spaces around dash for OCR)
+RE_REFERENCE_CODE = re.compile(r"\b(\d{4})\s*-\s*(\d{6,9})\b")
 
 # Seller / shop meta
 RE_SELLER_ID = re.compile(
@@ -291,6 +321,8 @@ RE_WHT_AMOUNT = re.compile(
     r"(?:.*?(?:จำนวน(?:เงิน)?|amounting\s*to|เป็นจำนวน))?\s*[:#：]?\s*฿?\s*([0-9,]+(?:\.[0-9]{1,2})?)",
     re.IGNORECASE | re.DOTALL
 )
+
+RE_WHT_HINT = re.compile(r"(withholding\s+tax|หักภาษี|ณ\s*ที่จ่าย|wht)", re.IGNORECASE)
 
 # Payment method patterns
 RE_PAYMENT_METHOD = re.compile(
@@ -343,7 +375,7 @@ def base_row_dict() -> Dict[str, Any]:
         "M_qty": "1",
         "N_unit_price": "0",
         "O_vat_rate": "7%",
-        "P_wht": "0",
+        "P_wht": "0",          # ✅ rate-only string "3%" or "0"
         "Q_payment_method": "",
         "R_paid_amount": "0",
         "S_pnd": "",
@@ -373,17 +405,13 @@ def detect_platform_vendor(text: str) -> Tuple[str, str]:
 
     return ("", "")
 
-
 def _tax_id_candidates_with_positions(text: str) -> List[Tuple[int, str]]:
-    """
-    Return list of (pos, tax_id_13) found in text.
-    """
+    """Return list of (pos, tax_id_13) found in text."""
     t = normalize_text(text)
     out: List[Tuple[int, str]] = []
     for m in RE_TAX13_STRICT.finditer(t):
         out.append((m.start(), m.group(1)))
     return out
-
 
 def find_vendor_tax_id(text: str, vendor_code: str = "") -> str:
     """
@@ -428,7 +456,6 @@ def find_vendor_tax_id(text: str, vendor_code: str = "") -> str:
     if not candidates:
         return ""
 
-    # vendor keyword anchors
     vendor_kw = ""
     if vendor_code == "Shopee":
         vendor_kw = "shopee"
@@ -444,24 +471,20 @@ def find_vendor_tax_id(text: str, vendor_code: str = "") -> str:
         for m in re.finditer(vendor_kw, t, re.IGNORECASE):
             anchor_positions.append(m.start())
 
-    # score: minimal distance to anchor, skip client ids
     best_tax = ""
-    best_score = None
+    best_score: Optional[int] = None
 
     for pos, tax in candidates:
         if tax in CLIENT_TAX_IDS:
             continue
         if not anchor_positions:
-            # no anchors: pick first non-client
-            return tax
-
+            return tax  # first non-client
         dist = min(abs(pos - a) for a in anchor_positions)
         if best_score is None or dist < best_score:
             best_score = dist
             best_tax = tax
 
     return best_tax or ""
-
 
 def find_branch(text: str) -> str:
     """Extract branch code (00000 for head office)"""
@@ -476,102 +499,142 @@ def find_branch(text: str) -> str:
 
     return "00000"
 
-
-def _find_reference_code_near(text: str, doc_number: str, max_distance: int = 80) -> str:
+def _find_reference_code_near(text: str, doc_number: str, max_distance: int = 120) -> str:
     """
     Find reference code (MMDD-NNNNNNN) near a document number.
-    We search near doc_number position in LINE-AWARE text.
+    - allow spaces around dash
+    Returns "MMDD-NNNNNNN" (normalized)
     """
     if not doc_number:
         return ""
 
     pos = text.find(doc_number)
     if pos == -1:
-        return ""
+        # try squashed search
+        t_sq = squash_all_ws(text)
+        d_sq = squash_all_ws(doc_number)
+        p2 = t_sq.find(d_sq)
+        if p2 == -1:
+            return ""
+        start = max(0, p2 - max_distance * 2)
+        end = min(len(t_sq), p2 + len(d_sq) + max_distance * 2)
+        nearby = t_sq[start:end]
+        m = RE_REFERENCE_CODE.search(nearby)
+        if not m:
+            return ""
+        return f"{m.group(1)}-{m.group(2)}"
 
     start = max(0, pos - max_distance)
     end = min(len(text), pos + len(doc_number) + max_distance)
     nearby = text[start:end]
 
     m = RE_REFERENCE_CODE.search(nearby)
-    return m.group(1) if m else ""
-
+    if not m:
+        return ""
+    return f"{m.group(1)}-{m.group(2)}"
 
 def _clean_doc_number(s: str) -> str:
     if not s:
         return ""
     x = str(s).strip().strip('"').strip("'")
-    # remove trailing punctuation
     x = re.sub(r"[,\.;:]+$", "", x)
     return x
-
 
 def find_invoice_no(text: str, platform: str = "") -> str:
     """
     Extract invoice/document number with full reference.
     ENHANCED: captures "DOC ... REF" and tries to attach ref code if near.
+    ✅ Returns STRICT NO-SPACE reference by default.
 
     Returns:
-      - "DOC REF" if ref exists
-      - else "DOC"
+      - "DOCREF"  (no spaces) if ref exists
+      - else "DOC" (no spaces)
     """
     t = normalize_text(text)
+    t_sq = squash_all_ws(t)
+
+    def pack(doc: str, ref: str = "") -> str:
+        if not doc:
+            return ""
+        s = f"{doc}{ref}" if ref else doc
+        return normalize_reference_no_space(s)
 
     # 1) Platform-specific WITH reference first (highest precision)
     if platform == "SPX":
         m = RE_SPX_DOC_WITH_REF.search(t)
         if m:
-            return f"{m.group(1)} {m.group(2)}"
+            return pack(m.group(1), f"{m.group(2)}-{m.group(3)}")
         m = RE_SPX_DOC.search(t)
         if m:
             doc = m.group(1)
             ref = _find_reference_code_near(t, doc)
-            return f"{doc} {ref}" if ref else doc
+            return pack(doc, ref) if ref else pack(doc)
 
     if platform == "Shopee":
         m = RE_SHOPEE_DOC_WITH_REF.search(t)
         if m:
-            return f"{m.group(1)} {m.group(2)}"
+            # NOTE: RE has only (doc)(mmdd)(seq) form in this file
+            # Here pattern already returns exact groups? For safety:
+            # If your upstream regex returns "doc + (mmdd-seq)" as group2, it still works via pack(doc, group2)
+            try:
+                return pack(m.group(1), f"{m.group(2)}-{m.group(3)}")  # if 3 groups
+            except Exception:
+                return pack(m.group(1), m.group(2))
         m = RE_SHOPEE_DOC.search(t)
         if m:
             doc = m.group(1)
             ref = _find_reference_code_near(t, doc)
-            return f"{doc} {ref}" if ref else doc
+            return pack(doc, ref) if ref else pack(doc)
 
     if platform == "Lazada":
         m = RE_LAZADA_DOC_WITH_REF.search(t)
         if m:
-            return f"{m.group(1)} {m.group(2)}"
+            try:
+                return pack(m.group(1), f"{m.group(2)}-{m.group(3)}")
+            except Exception:
+                return pack(m.group(1), m.group(2))
         m = RE_LAZADA_DOC.search(t)
         if m:
             doc = m.group(1)
             ref = _find_reference_code_near(t, doc)
-            return f"{doc} {ref}" if ref else doc
+            return pack(doc, ref) if ref else pack(doc)
 
     if platform == "TikTok":
         m = RE_TIKTOK_DOC_WITH_REF.search(t)
         if m:
-            return f"{m.group(1)} {m.group(2)}"
+            try:
+                return pack(m.group(1), f"{m.group(2)}-{m.group(3)}")
+            except Exception:
+                return pack(m.group(1), m.group(2))
         m = RE_TIKTOK_DOC.search(t)
         if m:
             doc = m.group(1)
             ref = _find_reference_code_near(t, doc)
-            return f"{doc} {ref}" if ref else doc
+            return pack(doc, ref) if ref else pack(doc)
 
-    # 2) Generic full reference patterns
+    # 2) Generic full reference patterns (DOC + mmdd-seq)
     m = RE_INVOICE_WITH_REF.search(t)
     if m:
-        return f"{m.group(1)} {m.group(2)}"
+        doc = m.group(1)
+        ref = f"{m.group(2)}-{m.group(3)}"
+        return pack(doc, ref)
 
     m = RE_INVOICE_WITH_LONG_REF.search(t)
     if m:
-        return f"{m.group(1)} {m.group(2)}"
+        doc = m.group(1)
+        ref = f"{m.group(2)}-{m.group(3)}"
+        return pack(doc, ref)
 
-    # 3) Try any platform patterns (with ref)
+    # 3) Try any platform doc WITH ref (generic try)
     for pat in (RE_SPX_DOC_WITH_REF, RE_SHOPEE_DOC_WITH_REF, RE_LAZADA_DOC_WITH_REF, RE_TIKTOK_DOC_WITH_REF):
         m = pat.search(t)
         if m:
-            return f"{m.group(1)} {m.group(2)}"
+            # attempt to join groups robustly
+            if m.lastindex and m.lastindex >= 3:
+                return pack(m.group(1), f"{m.group(2)}-{m.group(3)}")
+            if m.lastindex and m.lastindex >= 2:
+                return pack(m.group(1), m.group(2))
+            return pack(m.group(1))
 
     # 4) Try platform patterns (without ref)
     for pat in (RE_SPX_DOC, RE_SHOPEE_DOC, RE_LAZADA_DOC, RE_TIKTOK_DOC):
@@ -579,24 +642,28 @@ def find_invoice_no(text: str, platform: str = "") -> str:
         if m:
             doc = m.group(1)
             ref = _find_reference_code_near(t, doc)
-            return f"{doc} {ref}" if ref else doc
+            return pack(doc, ref) if ref else pack(doc)
 
     # 5) Generic invoice field (fallback)
     m = RE_INVOICE_GENERIC.search(t)
     if m:
         doc = _clean_doc_number(m.group(1))
-        # guard: avoid capturing very short junk
         if len(doc) >= 6:
             ref = _find_reference_code_near(t, doc)
-            return f"{doc} {ref}" if ref else doc
+            return pack(doc, ref) if ref else pack(doc)
+
+    # 6) LAST: attempt to recover from squashed text
+    m_doc = re.search(r"(RCS[A-Z0-9\-/]{8,})", t_sq, flags=re.IGNORECASE)
+    m_ref = RE_REFERENCE_CODE.search(t_sq)
+    if m_doc and m_ref:
+        return pack(m_doc.group(1), f"{m_ref.group(1)}-{m_ref.group(2)}")
+    if m_doc:
+        return pack(m_doc.group(1))
 
     return ""
 
-
 def _date_candidates_with_positions(text: str) -> List[Tuple[int, str]]:
-    """
-    Return list of (pos, yyyymmdd) candidates extracted from multiple patterns.
-    """
+    """Return list of (pos, yyyymmdd) candidates extracted from multiple patterns."""
     t = normalize_text(text)
     out: List[Tuple[int, str]] = []
 
@@ -625,7 +692,6 @@ def _date_candidates_with_positions(text: str) -> List[Tuple[int, str]]:
 
     return out
 
-
 def find_best_date(text: str) -> str:
     """
     Find best date from text (YYYYMMDD).
@@ -649,7 +715,7 @@ def find_best_date(text: str) -> str:
 
     def score(pos: int) -> int:
         if not anchors:
-            return 10_000_000  # no anchors -> neutral
+            return 10_000_000
         return min(abs(pos - a) for a in anchors)
 
     best = None  # (score, -date_int, yyyymmdd)
@@ -658,13 +724,11 @@ def find_best_date(text: str) -> str:
             y_int = int(y)
         except Exception:
             continue
-        s = score(pos)
-        key = (s, -y_int, y)
+        key = (score(pos), -y_int, y)
         if best is None or key < best:
             best = key
 
     return best[2] if best else ""
-
 
 def extract_seller_info(text: str) -> Dict[str, str]:
     """Extract seller/shop information"""
@@ -692,22 +756,21 @@ def extract_seller_info(text: str) -> Dict[str, str]:
 
     return info
 
-
 def _best_amount_candidate(matches: List[Tuple[int, str]], anchors: List[str], text: str) -> str:
     """
     Choose best amount candidate by proximity to anchors + sane numeric check.
-    matches = [(pos, money_str), ...]
+    ✅ anti-WHT pollution: ignore matches whose context contains WHT hints.
     """
     if not matches:
         return ""
 
-    t = text.lower()
+    t_low = text.lower()
     anchor_pos: List[int] = []
     for kw in anchors:
-        idx = t.find(kw)
+        idx = t_low.find(kw)
         while idx != -1:
             anchor_pos.append(idx)
-            idx = t.find(kw, idx + 1)
+            idx = t_low.find(kw, idx + 1)
 
     def dist(pos: int) -> int:
         if not anchor_pos:
@@ -716,19 +779,24 @@ def _best_amount_candidate(matches: List[Tuple[int, str]], anchors: List[str], t
 
     best = None  # (dist, -amount, str)
     for pos, amt_str in matches:
+        # anti-WHT vicinity guard
+        ctx = text[max(0, pos - 80): min(len(text), pos + 120)]
+        if RE_WHT_HINT.search(ctx):
+            continue
+
         amt = parse_money(amt_str)
         if not amt:
             continue
-        try:
-            a = Decimal(amt)
-        except Exception:
+
+        a = safe_decimal(amt)
+        if a <= 0:
             continue
+
         key = (dist(pos), -a, amt)
         if best is None or key < best:
             best = key
 
     return best[2] if best else ""
-
 
 def extract_amounts(text: str) -> Dict[str, str]:
     """
@@ -736,7 +804,8 @@ def extract_amounts(text: str) -> Dict[str, str]:
 
     New logic:
     - Collect multiple candidates for total/subtotal/vat then choose the best by proximity.
-    - Still calculate missing values if possible.
+    - ✅ anti-WHT pollution: do not choose totals near WHT keywords
+    - ✅ never let WHT amount become total (common OCR bug)
     """
     t = normalize_text(text)
     amounts = {
@@ -768,7 +837,7 @@ def extract_amounts(text: str) -> Dict[str, str]:
         text=t,
     )
 
-    # WHT (single best match, but regex may return multiple)
+    # WHT (collect best match)
     wht_best = None  # (dist, amount, rate)
     for m in RE_WHT_AMOUNT.finditer(t):
         rate = ""
@@ -778,51 +847,71 @@ def extract_amounts(text: str) -> Dict[str, str]:
                 rate = f"{m.group(1)}%"
             amt_raw = m.group(2)
         else:
-            # fallback
-            amt_raw = m.group(1) if m.lastindex == 1 else (m.group(2) if m.lastindex else "")
+            amt_raw = (m.group(1) if m.lastindex == 1 else "")
 
         amt = parse_money(amt_raw)
         if not amt:
             continue
 
         pos = m.start()
-        # anchor: "หัก ณ ที่จ่าย" / "withholding"
-        d = min(
-            abs(pos - i)
-            for i in ([p for p in (t.lower().find("withholding"), t.lower().find("หักภาษี"), t.lower().find("ณ ที่จ่าย")) if p != -1] or [0])
-        )
-        key = (d, Decimal(amt))
-        if wht_best is None or key < (wht_best[0], Decimal(wht_best[1])):
+        # anchor: WHT keywords
+        ctx = t[max(0, pos - 100): min(len(t), pos + 160)]
+        if not RE_WHT_HINT.search(ctx):
+            # if regex hit but context has no WHT hint, ignore (false positive)
+            continue
+
+        # distance to nearest hint occurrence inside ctx (smaller is better)
+        # safe scoring
+        d = 0
+        try:
+            low = ctx.lower()
+            hits = []
+            for kw in ["withholding", "wht", "หักภาษี", "ณ ที่จ่าย"]:
+                p = low.find(kw)
+                if p != -1:
+                    hits.append(p)
+            d = min(hits) if hits else 0
+        except Exception:
+            d = 0
+
+        key = (d, safe_decimal(amt))
+        if wht_best is None or key < (wht_best[0], safe_decimal(wht_best[1])):
             wht_best = (d, amt, rate)
 
     if wht_best:
         amounts["wht_amount"] = wht_best[1]
         amounts["wht_rate"] = wht_best[2] or ""
 
+    # ✅ never allow total == wht_amount
+    if amounts["total"] and amounts["wht_amount"] and amounts["total"] == amounts["wht_amount"]:
+        amounts["total"] = ""
+
     # Calculate missing values
     try:
         if amounts["subtotal"] and amounts["vat"] and not amounts["total"]:
-            sub = Decimal(amounts["subtotal"])
-            v = Decimal(amounts["vat"])
-            amounts["total"] = f"{(sub + v):.2f}"
+            sub = safe_decimal(amounts["subtotal"])
+            v = safe_decimal(amounts["vat"])
+            if sub > 0 and v >= 0:
+                amounts["total"] = f"{(sub + v):.2f}"
 
         if amounts["total"] and amounts["vat"] and not amounts["subtotal"]:
-            tot = Decimal(amounts["total"])
-            v = Decimal(amounts["vat"])
-            amounts["subtotal"] = f"{(tot - v):.2f}"
+            tot = safe_decimal(amounts["total"])
+            v = safe_decimal(amounts["vat"])
+            if tot > 0 and v >= 0 and tot >= v:
+                amounts["subtotal"] = f"{(tot - v):.2f}"
 
         # If only subtotal found, infer VAT and total (7%)
         if amounts["subtotal"] and not amounts["vat"]:
-            sub = Decimal(amounts["subtotal"])
-            v = (sub * Decimal("0.07"))
-            amounts["vat"] = f"{v:.2f}"
-            if not amounts["total"]:
-                amounts["total"] = f"{(sub + v):.2f}"
+            sub = safe_decimal(amounts["subtotal"])
+            if sub > 0:
+                v = (sub * Decimal("0.07"))
+                amounts["vat"] = f"{v:.2f}"
+                if not amounts["total"]:
+                    amounts["total"] = f"{(sub + v):.2f}"
     except Exception:
         pass
 
     return amounts
-
 
 def find_payment_method(text: str, platform: str = "") -> str:
     """Extract payment method"""
@@ -839,7 +928,6 @@ def find_payment_method(text: str, platform: str = "") -> str:
 
     return ""
 
-
 # ============================================================
 # Validation and formatting
 # ============================================================
@@ -847,7 +935,6 @@ def find_payment_method(text: str, platform: str = "") -> str:
 def validate_tax_id(tax_id: str) -> bool:
     """Validate 13-digit tax ID"""
     return bool(tax_id) and len(tax_id) == 13 and tax_id.isdigit()
-
 
 def validate_date(date_str: str) -> bool:
     """Validate YYYYMMDD format"""
@@ -859,25 +946,14 @@ def validate_date(date_str: str) -> bool:
     except Exception:
         return False
 
-
-def compute_wht_from_rate(subtotal: str, rate_str: str) -> str:
-    """Calculate WHT amount from subtotal and rate (round 2 decimals)"""
-    if not subtotal or not rate_str:
-        return ""
-    try:
-        amount = Decimal(str(subtotal))
-        rate = str(rate_str).replace("%", "").strip()
-        r = Decimal(rate)
-        if r > 1:
-            r = r / 100
-        wht = (amount * r)
-        return f"{wht:.2f}"
-    except Exception:
-        return ""
-
-
 def format_peak_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    """Final formatting and validation for PEAK import"""
+    """
+    Final formatting and validation for PEAK import
+
+    ✅ IMPORTANT CHANGE (per your latest requirement):
+    - P_wht is RATE-ONLY: "3%" or "0"
+    - Do NOT compute withholding amount here (extractor notes may store amount elsewhere if needed)
+    """
     formatted = base_row_dict()
     formatted.update(row)
 
@@ -888,40 +964,61 @@ def format_peak_row(row: Dict[str, Any]) -> Dict[str, Any]:
             formatted[key] = "0"
             continue
         try:
-            d = Decimal(str(val).replace(",", ""))
-            formatted[key] = f"{d:.2f}"
+            d = safe_decimal(val)
+            if d <= 0:
+                formatted[key] = "0"
+            else:
+                formatted[key] = f"{d:.2f}"
         except Exception:
             formatted[key] = "0"
 
-    # WHT: allow either amount or "3%" style (compute from subtotal)
-    w = formatted.get("P_wht", "")
-    if w in (None, "", "0", 0):
+    # ✅ P_wht rate-only enforcement
+    w = str(formatted.get("P_wht", "") or "").strip()
+    if not w or w in ("0", "0.0", "0.00"):
         formatted["P_wht"] = "0"
     else:
-        if "%" in str(w) and formatted.get("N_unit_price", "0") != "0":
-            computed = compute_wht_from_rate(formatted["N_unit_price"], str(w))
-            formatted["P_wht"] = computed if computed else "0"
+        # Accept "3%" style; accept "3" -> "3%"
+        if w.endswith("%"):
+            # normalize
+            w_num = re.sub(r"[^\d\.]", "", w)
+            formatted["P_wht"] = f"{w_num}%" if w_num else "0"
         else:
-            try:
-                d = Decimal(str(w).replace(",", ""))
-                formatted["P_wht"] = f"{d:.2f}"
-            except Exception:
+            # numeric -> treat as rate and convert to percent if plausible (e.g. "3" => "3%")
+            w_num = re.sub(r"[^\d\.]", "", w)
+            if not w_num:
                 formatted["P_wht"] = "0"
+            else:
+                # if someone sent "0.03" accidentally, convert to 3%
+                try:
+                    dv = safe_decimal(w_num)
+                    if dv == 0:
+                        formatted["P_wht"] = "0"
+                    elif dv < 1:
+                        formatted["P_wht"] = f"{(dv * Decimal('100')):.0f}%"
+                    else:
+                        formatted["P_wht"] = f"{dv:.0f}%"
+                except Exception:
+                    formatted["P_wht"] = "0"
 
-    # PND
+    # PND: set only if P_wht != 0
     if formatted["P_wht"] != "0" and not formatted.get("S_pnd"):
         formatted["S_pnd"] = "53"
+    if formatted["P_wht"] == "0":
+        formatted["S_pnd"] = formatted.get("S_pnd") or ""
 
     # Validate dates
     for k in ["B_doc_date", "H_invoice_date", "I_tax_purchase_date"]:
         if formatted.get(k) and not validate_date(formatted[k]):
             formatted[k] = ""
 
-    # Sync C/G
+    # Sync C/G (and enforce no-space)
     if not formatted.get("C_reference") and formatted.get("G_invoice_no"):
         formatted["C_reference"] = formatted["G_invoice_no"]
     if not formatted.get("G_invoice_no") and formatted.get("C_reference"):
         formatted["G_invoice_no"] = formatted["C_reference"]
+
+    formatted["C_reference"] = normalize_reference_no_space(formatted.get("C_reference", ""))
+    formatted["G_invoice_no"] = normalize_reference_no_space(formatted.get("G_invoice_no", ""))
 
     # Branch safety
     formatted["F_branch_5"] = fmt_branch_5(formatted.get("F_branch_5", "00000"))
@@ -931,7 +1028,6 @@ def format_peak_row(row: Dict[str, Any]) -> Dict[str, Any]:
         formatted["E_tax_id_13"] = ""
 
     return formatted
-
 
 # ============================================================
 # Backward Compatibility Functions (for generic.py)
@@ -943,11 +1039,9 @@ def find_tax_id(text: str) -> str:
     m = RE_TAX13_STRICT.search(t)
     return m.group(1) if m else ""
 
-
 def find_first_date(text: str) -> str:
     """Backward compatibility wrapper"""
     return find_best_date(text)
-
 
 def find_total_amount(text: str) -> str:
     """Extract total amount from text (legacy helper)"""
@@ -978,7 +1072,6 @@ def find_total_amount(text: str) -> str:
 
     return ""
 
-
 # ============================================================
 # Export all functions
 # ============================================================
@@ -987,6 +1080,8 @@ __all__ = [
     # Normalization
     "normalize_text",
     "normalize_one_line",
+    "squash_all_ws",
+    "normalize_reference_no_space",
     "fmt_tax_13",
     "fmt_branch_5",
     "parse_date_to_yyyymmdd",
@@ -1011,7 +1106,6 @@ __all__ = [
     # Validation
     "validate_tax_id",
     "validate_date",
-    "compute_wht_from_rate",
     "format_peak_row",
 
     # Backward compatibility

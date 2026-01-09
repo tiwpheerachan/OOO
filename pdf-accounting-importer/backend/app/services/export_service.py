@@ -13,10 +13,12 @@ from openpyxl.utils import get_column_letter
 
 
 # =========================
-# Columns (PEAK A-U)
+# Columns
 # =========================
+# ✅ เพิ่ม A_company_name ต่อจาก A_seq
 COLUMNS: List[Tuple[str, str]] = [
     ("A_seq", "ลำดับที่*"),
+    ("A_company_name", "ชื่อบริษัท"),
     ("B_doc_date", "วันที่เอกสาร"),
     ("C_reference", "อ้างอิงถึง"),
     ("D_vendor_code", "ผู้รับเงิน/คู่ค้า"),
@@ -39,52 +41,50 @@ COLUMNS: List[Tuple[str, str]] = [
     ("U_group", "กลุ่มจัดประเภท"),
 ]
 
-# Columns that MUST be treated as TEXT in Excel (preserve leading zeros, exact strings)
+# Columns that MUST be TEXT in Excel (preserve leading zeros, exact strings)
 TEXT_COL_KEYS = {
-    "A_seq",           # sometimes treated as number, but safe to keep as text (PEAK accepts)
+    "A_seq",            # keep as text is fine for PEAK import
+    "A_company_name",
     "C_reference",
     "D_vendor_code",
     "E_tax_id_13",
     "F_branch_5",
     "G_invoice_no",
-    "J_price_type",    # keep as text "1"/"2"/"3"
-    "O_vat_rate",      # "7%" or "NO"
-    "S_pnd",           # "53" etc.
+    "J_price_type",     # "1"/"2"/"3"
+    "O_vat_rate",       # "7%" or "NO"
+    "S_pnd",            # "53" etc.
+    "Q_payment_method", # wallet code e.g. EWL001
 }
 
-# Numeric-like columns (we will write as numbers when safe)
+# Numeric-like columns (write as numbers when safe)
 NUM_COL_KEYS = {
     "M_qty",
     "N_unit_price",
-    "P_wht",          # if percent like "3%" keep as text; if amount keep numeric
     "R_paid_amount",
+    # NOTE: P_wht เราจะบังคับให้เป็น "" เสมอ (ไม่ต้องเขียนเป็นตัวเลข)
 }
 
-# Date columns are strings "YYYYMMDD" (keep as text so PEAK import consistent)
+# Date columns are strings "YYYYMMDD" (keep as text)
 DATE_COL_KEYS = {"B_doc_date", "H_invoice_date", "I_tax_purchase_date"}
 
-# CSV/Excel injection prevention (when a cell starts with these, Excel may interpret as formula)
+# CSV/Excel injection prevention
 EXCEL_INJECTION_PREFIXES = ("=", "+", "-", "@")
 
 RE_YYYYMMDD = re.compile(r"^\d{8}$")
 RE_DECIMAL = re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
+RE_ALL_WS = re.compile(r"\s+")
 
 
 # =========================
 # Helpers
 # =========================
 def _s(v: Any) -> str:
-    """Safe stringify (trim)."""
     if v is None:
         return ""
     return str(v).strip()
 
 
 def _escape_excel_formula(s: str) -> str:
-    """
-    Prevent CSV/XLSX formula injection for text cells.
-    If it starts with = + - @, prefix with apostrophe.
-    """
     if not s:
         return s
     if s[0] in EXCEL_INJECTION_PREFIXES:
@@ -93,10 +93,6 @@ def _escape_excel_formula(s: str) -> str:
 
 
 def _as_decimal_str(s: str) -> str:
-    """
-    Normalize numeric string to 2 decimals if possible; else ''.
-    Accepts: '1,234.5', '1234', '1234.00'
-    """
     if not s:
         return ""
     x = s.replace(",", "").replace("฿", "").replace("THB", "").strip()
@@ -107,37 +103,60 @@ def _as_decimal_str(s: str) -> str:
         return ""
 
 
+def _compact_no_ws(v: Any) -> str:
+    """
+    ✅ ตัด whitespace ทั้งหมด (space/newline/tab) ให้ token ติดกัน
+    เช่น "RCSPX...-25 1218-0001" -> "RCSPX...-251218-0001"
+    """
+    s = _s(v)
+    if not s:
+        return ""
+    return RE_ALL_WS.sub("", s)
+
+
+def _preprocess_rows_for_export(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    ✅ รวมกฎที่คุณต้องการก่อน export ให้ “ชัวร์” แม้ upstream พลาด:
+    1) A_seq = 1..n ใหม่ตามลำดับปัจจุบัน
+    2) P_wht = "" เสมอ
+    3) C_reference / G_invoice_no ติดกันไม่มีช่องว่าง
+    """
+    out: List[Dict[str, Any]] = []
+    seq = 1
+
+    for r in rows or []:
+        rr = dict(r)
+
+        rr["A_seq"] = str(seq)  # keep as text in Excel too
+        seq += 1
+
+        # force blank WHT
+        rr["P_wht"] = ""
+
+        # compact reference/invoice tokens
+        rr["C_reference"] = _compact_no_ws(rr.get("C_reference", ""))
+        rr["G_invoice_no"] = _compact_no_ws(rr.get("G_invoice_no", ""))
+
+        # normalize company name if missing
+        rr["A_company_name"] = _s(rr.get("A_company_name", ""))
+
+        out.append(rr)
+
+    return out
+
+
 def _to_number_or_text(key: str, raw: Any) -> Tuple[Any, str]:
-    """
-    Decide what value to write to XLSX and which number_format to apply.
-    Returns: (value, number_format)
-      - value may be str or numeric
-      - number_format is an openpyxl format string (or '' meaning default)
-    """
     s = _s(raw)
 
-    # Always treat these as text (including dates in YYYYMMDD)
+    # Always treat these as text (including dates YYYYMMDD)
     if key in TEXT_COL_KEYS or key in DATE_COL_KEYS:
         return (_escape_excel_formula(s), numbers.FORMAT_TEXT)
 
     # For numeric fields, try numeric, else text
     if key in NUM_COL_KEYS:
-        # Special: P_wht can be "3%" (keep as text)
-        if key == "P_wht":
-            if "%" in s:
-                return (_escape_excel_formula(s), numbers.FORMAT_TEXT)
-            # else treat as amount
-            norm = _as_decimal_str(s)
-            if norm:
-                return (float(norm), numbers.FORMAT_NUMBER_00)
-            return (_escape_excel_formula(s), numbers.FORMAT_TEXT)
-
-        # qty can be integer-ish
         if key == "M_qty":
-            # allow "1", "1.0"
             norm = _as_decimal_str(s)
             if norm:
-                # if looks integer, write int
                 try:
                     f = float(norm)
                     if abs(f - int(f)) < 1e-9:
@@ -158,25 +177,19 @@ def _to_number_or_text(key: str, raw: Any) -> Tuple[Any, str]:
 
 
 def _auto_fit_columns(ws, max_width: int = 60, min_width: int = 10) -> None:
-    """
-    Approximate auto-fit width (works ok for Thai/English mixed).
-    """
-    for col_idx, (key, label) in enumerate(COLUMNS, start=1):
+    for col_idx, (_key, label) in enumerate(COLUMNS, start=1):
         col_letter = get_column_letter(col_idx)
         max_len = len(str(label))
 
-        # Check body values
         for row_idx in range(2, ws.max_row + 1):
             v = ws.cell(row=row_idx, column=col_idx).value
             if v is None:
                 continue
             s = str(v)
-            # slightly reduce long multi-line notes
             if "\n" in s:
                 s = s.split("\n", 1)[0]
             max_len = max(max_len, len(s))
 
-        # heuristic: Thai tends to be wider; add padding
         width = int(min(max(max_len + 2, min_width), max_width))
         ws.column_dimensions[col_letter].width = width
 
@@ -185,21 +198,17 @@ def _auto_fit_columns(ws, max_width: int = 60, min_width: int = 10) -> None:
 # CSV Export
 # =========================
 def export_rows_to_csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
-    """
-    Export PEAK import CSV (UTF-8-SIG) with:
-    - Excel injection protection for text cells
-    - Preserve leading zeros for critical fields by keeping them as strings
-    """
+    rows2 = _preprocess_rows_for_export(rows)
+
     out = io.StringIO()
     wri = csv.writer(out, quoting=csv.QUOTE_MINIMAL)
 
     wri.writerow([label for _, label in COLUMNS])
 
-    for r in rows:
+    for r in rows2:
         row_out: List[str] = []
         for k, _label in COLUMNS:
             s = _s(r.get(k, ""))
-            # Protect against formula injection in CSV
             s = _escape_excel_formula(s)
             row_out.append(s)
         wri.writerow(row_out)
@@ -211,16 +220,8 @@ def export_rows_to_csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
 # XLSX Export
 # =========================
 def export_rows_to_xlsx_bytes(rows: List[Dict[str, Any]]) -> bytes:
-    """
-    Export PEAK import XLSX with:
-    - Freeze header
-    - Auto-filter
-    - Nice header style
-    - Text formatting for critical columns (Tax ID, Branch, Invoice No, Reference, Vendor Code)
-    - Numeric formatting for amounts when possible
-    - Excel injection protection for text cells
-    - Auto-fit column widths
-    """
+    rows2 = _preprocess_rows_for_export(rows)
+
     wb = Workbook()
     ws = wb.active
     ws.title = "PEAK_IMPORT"
@@ -230,7 +231,7 @@ def export_rows_to_xlsx_bytes(rows: List[Dict[str, Any]]) -> bytes:
     ws.append(headers)
 
     # Header styling
-    header_fill = PatternFill("solid", fgColor="E8F1FF")  # light blue glass-ish
+    header_fill = PatternFill("solid", fgColor="E8F1FF")
     header_font = Font(bold=True)
     header_align = Alignment(vertical="center", horizontal="center", wrap_text=True)
 
@@ -245,9 +246,10 @@ def export_rows_to_xlsx_bytes(rows: List[Dict[str, Any]]) -> bytes:
         c.border = border
 
     # Data rows
-    for r in rows:
+    for r in rows2:
         values: List[Any] = []
         formats: List[str] = []
+
         for k, _label in COLUMNS:
             v, fmt = _to_number_or_text(k, r.get(k, ""))
             values.append(v)
@@ -255,36 +257,30 @@ def export_rows_to_xlsx_bytes(rows: List[Dict[str, Any]]) -> bytes:
 
         ws.append(values)
 
-        # Apply per-cell number formats for the row we just appended
         current_row = ws.max_row
         for col_idx, fmt in enumerate(formats, start=1):
             cell = ws.cell(row=current_row, column=col_idx)
             if fmt:
                 cell.number_format = fmt
-            # Style body a bit
-            cell.alignment = Alignment(vertical="top", wrap_text=(col_idx in {12, 20}))  # L_description, T_note
+            # wrap long text: L_description, T_note
+            cell.alignment = Alignment(vertical="top", wrap_text=(col_idx in {13, 21}))
             cell.border = border
 
-    # Freeze panes below header
     ws.freeze_panes = "A2"
-
-    # Auto filter on header row
     ws.auto_filter.ref = f"A1:{get_column_letter(len(COLUMNS))}1"
 
-    # Make sure all TEXT_COL_KEYS are forced to text format (even if empty)
+    # Force TEXT formatting for critical columns (even if empty)
     col_index = {k: i + 1 for i, (k, _) in enumerate(COLUMNS)}
-    for key in TEXT_COL_KEYS | DATE_COL_KEYS:
+    for key in (TEXT_COL_KEYS | DATE_COL_KEYS):
         ci = col_index.get(key)
         if not ci:
             continue
-        for row_i in range(2, 2 + len(rows)):
+        for row_i in range(2, 2 + len(rows2)):
             cell = ws.cell(row=row_i, column=ci)
             cell.number_format = numbers.FORMAT_TEXT
 
-    # Auto-fit widths
     _auto_fit_columns(ws)
 
-    # Save to bytes
     bio = io.BytesIO()
     wb.save(bio)
     return bio.getvalue()

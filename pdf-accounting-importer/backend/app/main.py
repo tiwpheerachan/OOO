@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import io
 import os
+import json
+import inspect
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
@@ -23,10 +25,9 @@ def _load_env_safely() -> None:
     except Exception:
         return
 
-    # candidate .env paths
     here = Path(__file__).resolve()
-    backend_dir = here.parents[2]  # .../backend
-    app_dir = here.parent          # .../backend/app
+    backend_dir = here.parents[2]       # .../backend
+    app_dir = here.parent               # .../backend/app
     project_root_guess = backend_dir.parent
 
     candidates = [
@@ -38,10 +39,8 @@ def _load_env_safely() -> None:
     for p in candidates:
         if p.exists():
             load_dotenv(dotenv_path=str(p), override=False)
-            # ใช้ไฟล์แรกที่เจอ
             return
 
-    # ถ้าไม่เจอไฟล์ ก็ลองโหลดแบบ default (จะโหลด .env ใน cwd ถ้ามี)
     load_dotenv(override=False)
 
 
@@ -90,6 +89,94 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
         "path": str(request.url),
     }
     return JSONResponse(status_code=500, content=payload)
+
+# =========================
+# Helpers: cfg parsing + safe service call
+# =========================
+def _parse_list_field(raw: Optional[str]) -> List[str]:
+    """
+    รองรับ:
+      - JSON string: '["SHD","RABBIT"]'
+      - comma-separated: 'SHD,RABBIT'
+      - single: 'SHD'
+      - empty/None -> []
+    """
+    if raw is None:
+        return []
+    s = str(raw).strip()
+    if not s:
+        return []
+
+    # Try JSON
+    if (s.startswith("[") and s.endswith("]")) or (s.startswith('"') and s.endswith('"')):
+        try:
+            v = json.loads(s)
+            if isinstance(v, list):
+                out: List[str] = []
+                for x in v:
+                    xs = str(x).strip()
+                    if xs:
+                        out.append(xs)
+                return out
+            if isinstance(v, str):
+                return [v.strip()] if v.strip() else []
+        except Exception:
+            pass
+
+    # Fallback: comma separated
+    if "," in s:
+        return [x.strip() for x in s.split(",") if x.strip()]
+
+    return [s]
+
+
+def _normalize_cfg(
+    client_tags: Optional[str],
+    client_tax_ids: Optional[str],
+    platforms: Optional[str],
+) -> Dict[str, Any]:
+    """
+    ทำ cfg ให้สะอาด + normalize ตัวอักษร
+    """
+    tags = [t.upper().strip() for t in _parse_list_field(client_tags)]
+    plats = [p.upper().strip() for p in _parse_list_field(platforms)]
+    taxs = [t.strip() for t in _parse_list_field(client_tax_ids)]
+
+    # ตัดค่าซ้ำ โดยยังรักษาลำดับ
+    def uniq(seq: List[str]) -> List[str]:
+        seen = set()
+        out = []
+        for x in seq:
+            if x and x not in seen:
+                seen.add(x)
+                out.append(x)
+        return out
+
+    return {
+        "client_tags": uniq(tags),
+        "client_tax_ids": uniq(taxs),
+        "platforms": uniq(plats),
+    }
+
+
+def _call_if_supported(obj: Any, method_name: str, /, *args: Any, **kwargs: Any) -> Any:
+    """
+    เรียก method แบบ backward-compatible:
+    - ถ้า method มีพารามิเตอร์ตาม kwargs -> ส่งให้
+    - ถ้าไม่รองรับ -> ตัด kwargs ออกแล้วเรียกแบบเดิม
+    """
+    fn = getattr(obj, method_name, None)
+    if fn is None:
+        raise AttributeError(f"{type(obj).__name__}.{method_name} not found")
+
+    try:
+        sig = inspect.signature(fn)
+        params = sig.parameters
+        supported = {k: v for k, v in kwargs.items() if k in params}
+        return fn(*args, **supported)
+    except Exception:
+        # fallback: call without kwargs
+        return fn(*args)
 
 
 # =========================
@@ -140,16 +227,26 @@ def config_check():
 
 
 @app.post("/api/upload")
-async def upload(files: List[UploadFile] = File(...)):
+async def upload(
+    files: List[UploadFile] = File(...),
+    # ✅ NEW: รับ cfg จาก FormData
+    client_tags: Optional[str] = Form(None),
+    client_tax_ids: Optional[str] = Form(None),
+    platforms: Optional[str] = Form(None),
+):
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded")
+
+    # ✅ parse + normalize cfg
+    cfg = _normalize_cfg(client_tags, client_tax_ids, platforms)
 
     # soft limit (กัน RAM พัง) ปรับได้ด้วย ENV
     max_files = int(os.getenv("MAX_UPLOAD_FILES", "500"))
     if len(files) > max_files:
         raise HTTPException(status_code=400, detail=f"Too many files (max {max_files})")
 
-    job_id = jobs.create_job()
+    # ✅ create job (attach cfg if JobService supports it)
+    job_id = _call_if_supported(jobs, "create_job", cfg=cfg)
 
     for f in files:
         content = await f.read()
@@ -164,15 +261,21 @@ async def upload(files: List[UploadFile] = File(...)):
                 detail=f"File too large: {f.filename} (max {max_mb} MB)",
             )
 
-        jobs.add_file(
+        # ✅ add file (attach cfg if add_file supports it)
+        _call_if_supported(
+            jobs,
+            "add_file",
             job_id=job_id,
             filename=f.filename or "unknown",
             content_type=f.content_type or "",
             content=content,
+            cfg=cfg,  # optional (only if supported)
         )
 
-    jobs.start_processing(job_id)
-    return {"ok": True, "job_id": job_id}
+    # ✅ start processing (attach cfg if start_processing supports it)
+    _call_if_supported(jobs, "start_processing", job_id, cfg=cfg)
+
+    return {"ok": True, "job_id": job_id, "cfg": cfg}
 
 
 @app.get("/api/job/{job_id}")

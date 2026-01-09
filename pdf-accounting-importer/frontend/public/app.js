@@ -1,6 +1,29 @@
 (() => {
   const el = (id) => document.getElementById(id);
 
+  // =========================================================
+  // ✅ Company constants (ตามที่คุณให้มา)
+  // =========================================================
+  const CLIENT_RABBIT = "0105561071873";
+  const CLIENT_SHD    = "0105563022918";
+  const CLIENT_TOPONE = "0105565027615";
+
+  const CLIENTS = {
+    SHD:     { label: "SHD",     taxId: CLIENT_SHD,    tokens: ["shd"] },
+    TOPONE:  { label: "TOPONE",  taxId: CLIENT_TOPONE, tokens: ["topone","top one","top_one","top-one"] },
+    RABBIT:  { label: "RABBIT",  taxId: CLIENT_RABBIT, tokens: ["rabbit","rb","rbb"] },
+    HASHTAG: { label: "HASHTAG", taxId: "",            tokens: ["hashtag","#hashtag","hash tag","hash-tag"] },
+  };
+
+  const PLATFORMS = {
+    SHOPEE:   { label: "SHOPEE",   tokens: ["shopee","spay"] },
+    LAZADA:   { label: "LAZADA",   tokens: ["lazada","laz"] },
+    TIKTOK:   { label: "TIKTOK",   tokens: ["tiktok","tts","ttshop","tik tok","tt_"] },
+    SPX:      { label: "SPX",      tokens: ["spx","shopee express","shopee-express"] },
+    FACEBOOK: { label: "FACEBOOK", tokens: ["facebook","fb","meta"] },
+    OTHER:    { label: "OTHER",    tokens: [] },
+  };
+
   const state = {
     files: [],
     jobId: null,
@@ -10,14 +33,26 @@
     backendUrl: localStorage.getItem("peak_backend_url") || "http://localhost:8000",
     pollTimer: null,
     editMode: false,
+
+    // ✅ pre-upload filters (multi select)
+    clientFilters: new Set(),    // e.g. {"SHD","RABBIT"}
+    platformFilters: new Set(),  // e.g. {"SHOPEE","TIKTOK"}
+
+    // ✅ remember which filters used for each job (local)
+    jobConfig: null,
   };
 
   const LS_HISTORY_KEY = "peak_job_history_v1";
   const LS_EDITS_PREFIX = "peak_job_edits::";
+  const LS_JOBCFG_PREFIX = "peak_job_cfg::";
   const HISTORY_MAX = 50;
 
+  // =========================================================
+  // ✅ Columns (เพิ่มคอลัมน์ ชื่อบริษัท)
+  // =========================================================
   const COLUMNS = [
     ["A_seq","ลำดับที่*"],
+    ["A_company_name","ชื่อบริษัท"], // ✅ NEW
     ["B_doc_date","วันที่เอกสาร"],
     ["C_reference","อ้างอิงถึง"],
     ["D_vendor_code","ผู้รับเงิน/คู่ค้า"],
@@ -42,7 +77,7 @@
     ["_source_file","ไฟล์ต้นทาง"],
   ];
 
-  const NON_EDITABLE = new Set(["_status","_source_file"]);
+  const NON_EDITABLE = new Set(["_status","_source_file","A_company_name"]);
 
   // ---- utils ----
   function setBackendUrl(v){
@@ -79,7 +114,95 @@
   }
 
   // =========================================================
-  // ✅ Snow: inject CSS + create snowflakes (scoped to backend card)
+  // ✅ Infer (จากชื่อไฟล์) เพื่อ pre-filter
+  // =========================================================
+  function normalizeName(s){
+    return String(s || "").toLowerCase().replace(/\s+/g, " ").trim();
+  }
+  function includesAnyToken(name, tokens){
+    const s = normalizeName(name);
+    for(const t of tokens || []){
+      if(!t) continue;
+      const rx = new RegExp(String(t).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      if(rx.test(s)) return true;
+    }
+    return false;
+  }
+
+  function inferClientTagFromFilename(filename){
+    const s = normalizeName(filename);
+    for(const tag of Object.keys(CLIENTS)){
+      const tokens = CLIENTS[tag].tokens || [];
+      if(tokens.length && includesAnyToken(s, tokens)) return tag;
+    }
+    if(/\bshd\b/.test(s)) return "SHD";
+    if(/\brabbit\b/.test(s) || /\brb\b/.test(s)) return "RABBIT";
+    if(/\btopone\b/.test(s) || /\btop one\b/.test(s)) return "TOPONE";
+    if(/\bhashtag\b/.test(s) || /#/.test(s)) return "HASHTAG";
+    return null;
+  }
+
+  function inferPlatformFromFilename(filename){
+    const s = normalizeName(filename);
+    if(/\bspx\b/.test(s) || /shopee\s*express/.test(s)) return "SPX";
+    if(/\bshopee\b/.test(s)) return "SHOPEE";
+    if(/\blazada\b/.test(s) || /\blaz\b/.test(s)) return "LAZADA";
+    if(/\btiktok\b/.test(s) || /\btts\b/.test(s) || /ttshop/.test(s)) return "TIKTOK";
+    if(/\bfacebook\b/.test(s) || /\bfb\b/.test(s) || /\bmeta\b/.test(s)) return "FACEBOOK";
+    return "OTHER";
+  }
+
+  // =========================================================
+  // ✅ Job config persistence
+  // =========================================================
+  function saveJobCfg(backendUrl, jobId, cfg){
+    try{
+      localStorage.setItem(LS_JOBCFG_PREFIX + jobKey(backendUrl, jobId), JSON.stringify(cfg || {}));
+    }catch(_){}
+  }
+  function loadJobCfg(backendUrl, jobId){
+    try{
+      const raw = localStorage.getItem(LS_JOBCFG_PREFIX + jobKey(backendUrl, jobId));
+      const obj = raw ? JSON.parse(raw) : null;
+      return obj && typeof obj === "object" ? obj : null;
+    }catch(_){ return null; }
+  }
+
+  function deriveCompanyNameFromRow(row){
+    // 1) ถ้า backend มีส่งมา (optional) จะใช้ก่อน
+    const clientTaxId = String(row._client_tax_id || row.client_tax_id || "").trim();
+    if(clientTaxId){
+      if(clientTaxId === CLIENT_RABBIT) return "RABBIT";
+      if(clientTaxId === CLIENT_SHD) return "SHD";
+      if(clientTaxId === CLIENT_TOPONE) return "TOPONE";
+    }
+    const clientTag = String(row._client_tag || row.client_tag || "").trim().toUpperCase();
+    if(clientTag && CLIENTS[clientTag]) return CLIENTS[clientTag].label;
+
+    // 2) fallback จาก config ตอน upload (ถ้าเลือกบริษัทเดียว)
+    if(state.jobConfig?.clientTags?.length === 1){
+      const only = state.jobConfig.clientTags[0];
+      if(CLIENTS[only]) return CLIENTS[only].label;
+    }
+
+    // 3) fallback เดาจากชื่อไฟล์
+    const src = String(row._source_file || "");
+    const inferred = inferClientTagFromFilename(src);
+    if(inferred && CLIENTS[inferred]) return CLIENTS[inferred].label;
+
+    return "";
+  }
+
+  function enrichRowsForUI(){
+    state.rows = (state.rows || []).map((r) => {
+      const row = (r && typeof r === "object") ? r : {};
+      row.A_company_name = row.A_company_name || deriveCompanyNameFromRow(row);
+      return row;
+    });
+  }
+
+  // =========================================================
+  // ✅ Snow (ของเดิม + เพิ่ม chipRow css นิดหน่อย)
   // =========================================================
   function ensureSnowCSS(){
     if(document.getElementById("snowStyle_v1")) return;
@@ -112,6 +235,10 @@
   10%  { opacity: 1; }
   100% { transform: translate3d(var(--drift, 0px), calc(100% + 90px), 0); opacity: 0.05; }
 }
+
+/* ===== Settings chip row (เพิ่มให้แน่ใจว่าจัดระเบียบ) ===== */
+.chipRow{ display:flex; gap:8px; flex-wrap:wrap; }
+.chip.ghost{ opacity:.82; }
     `.trim();
 
     const style = document.createElement("style");
@@ -124,47 +251,41 @@
     const snowContainer = document.getElementById(containerId);
     if(!snowContainer) return;
 
-    // ทำให้แน่ใจว่า CSS อยู่
     ensureSnowCSS();
-
-    // ล้างของเดิม (กันซ้ำ)
     snowContainer.innerHTML = "";
 
     const snowflakes = ["❄","❅","❆"];
 
-for(let i = 0; i < snowflakeCount; i++){
-  const snowflake = document.createElement("div");
-  snowflake.className = "snowflake";
-  snowflake.textContent = snowflakes[Math.floor(Math.random() * snowflakes.length)];
+    for(let i = 0; i < snowflakeCount; i++){
+      const snowflake = document.createElement("div");
+      snowflake.className = "snowflake";
+      snowflake.textContent = snowflakes[Math.floor(Math.random() * snowflakes.length)];
 
-  const left = Math.random() * 100;
-  const delay = Math.random() * 6;
-  const duration = 7 + Math.random() * 9;
-  const drift = (Math.random() - 0.5) * 70;   // ✅ ดริฟต์น้อยลง
-  const size = 9 + Math.random() * 5;         // ✅ เล็กลง
-  const opacity = 0.25 + Math.random() * 0.35;
+      const left = Math.random() * 100;
+      const delay = Math.random() * 6;
+      const duration = 7 + Math.random() * 9;
+      const drift = (Math.random() - 0.5) * 70;
+      const size = 9 + Math.random() * 5;
+      const opacity = 0.25 + Math.random() * 0.35;
+      const topStart = -18 - Math.random() * 40;
 
-  const topStart = -18 - Math.random() * 40;  // ✅ เพิ่มบรรทัดนี้
+      snowflake.style.left = `${left}%`;
+      snowflake.style.top = `${topStart}px`;
+      snowflake.style.animationDelay = `${delay}s`;
+      snowflake.style.animationDuration = `${duration}s`;
+      snowflake.style.setProperty("--drift", `${drift}px`);
+      snowflake.style.fontSize = `${size}px`;
+      snowflake.style.opacity = `${opacity}`;
 
-  snowflake.style.left = `${left}%`;
-  snowflake.style.top = `${topStart}px`;      // ✅ เพิ่มบรรทัดนี้
-  snowflake.style.animationDelay = `${delay}s`;
-  snowflake.style.animationDuration = `${duration}s`;
-  snowflake.style.setProperty("--drift", `${drift}px`);
-  snowflake.style.fontSize = `${size}px`;
-  snowflake.style.opacity = `${opacity}`;
-
-  snowContainer.appendChild(snowflake);
-}
+      snowContainer.appendChild(snowflake);
+    }
   }
 
   function initSnow(){
-    // สร้างให้การ์ด backend เท่านั้น
     const box = el("snowBackend");
     if(!box) return;
     createSnowflakes("snowBackend", 20);
 
-    // กันกรณี tab กลับมาแล้ว animation ค้าง
     document.addEventListener("visibilitychange", () => {
       if(document.visibilityState === "visible"){
         createSnowflakes("snowBackend", 20);
@@ -226,7 +347,7 @@ for(let i = 0; i < snowflakeCount; i++){
     }
   }
 
-  // ---- filter ----
+  // ---- filter (ตาราง) ----
   function matchRow(row){
     if(state.filter !== "all"){
       if(String(row._status||"").toUpperCase() !== state.filter) return false;
@@ -292,8 +413,6 @@ for(let i = 0; i < snowflakeCount; i++){
     }).join("");
 
     tbody.innerHTML = rowsHtml || `<tr><td colspan="${COLUMNS.length}" class="muted">ไม่มีข้อมูล</td></tr>`;
-
-    // ✅ after rendering: update horizontal dock sizing
     syncHScrollGeometry();
   }
 
@@ -408,10 +527,13 @@ for(let i = 0; i < snowflakeCount; i++){
         clearInterval(state.pollTimer);
         state.pollTimer = null;
 
+        state.jobConfig = loadJobCfg(state.backendUrl, state.jobId) || null;
+
         const rowsRes = await (await api(`/api/job/${state.jobId}/rows`)).json();
         state.rows = rowsRes.rows || [];
 
         applyEditsIfAny();
+        enrichRowsForUI();
         renderTable();
 
         el("btnCsv").disabled = false;
@@ -430,6 +552,9 @@ for(let i = 0; i < snowflakeCount; i++){
           review_files: job.review_files || 0,
           error_files: job.error_files || 0,
           rows_count: state.rows.length,
+
+          clientTags: state.jobConfig?.clientTags || [],
+          platforms: state.jobConfig?.platforms || [],
         });
       }
     }catch(e){
@@ -475,8 +600,10 @@ for(let i = 0; i < snowflakeCount; i++){
         `OK=${h.ok_files || 0}`,
         `Review=${h.review_files || 0}`,
         `Error=${h.error_files || 0}`,
-        `rows=${h.rows_count || 0}`
-      ].join(" · ");
+        `rows=${h.rows_count || 0}`,
+        (h.clientTags?.length ? `client=${h.clientTags.join("+")}` : ""),
+        (h.platforms?.length ? `platform=${h.platforms.join("+")}` : "")
+      ].filter(Boolean).join(" · ");
 
       return `
         <div class="hItem">
@@ -500,14 +627,11 @@ for(let i = 0; i < snowflakeCount; i++){
         if(!jobId || !backendUrl) return;
 
         setEditMode(false);
-
         setBackendUrl(backendUrl);
 
-        // ถ้ามี input backendUrl ให้ sync
         const backendUrlInput = el("backendUrl");
         if(backendUrlInput) backendUrlInput.value = state.backendUrl;
 
-        // ถ้ามี dropdown ให้ sync
         const backendSelect = el("backendSelect");
         if(backendSelect) backendSelect.value = backendUrl;
 
@@ -522,6 +646,8 @@ for(let i = 0; i < snowflakeCount; i++){
         el("btnXlsxEdited").disabled = true;
 
         try{
+          state.jobConfig = loadJobCfg(state.backendUrl, state.jobId) || null;
+
           const job = await (await api(`/api/job/${state.jobId}`)).json();
           if(jm) jm.textContent = formatJobMeta(job);
           setProgressUI(job);
@@ -531,6 +657,7 @@ for(let i = 0; i < snowflakeCount; i++){
           state.rows = rowsRes.rows || [];
 
           applyEditsIfAny();
+          enrichRowsForUI();
           renderTable();
 
           el("btnCsv").disabled = false;
@@ -626,7 +753,7 @@ for(let i = 0; i < snowflakeCount; i++){
     downloadBlob(blob, `peak_AU_edited_${state.jobId || "nojob"}.xls`);
   }
 
-  // ---- horizontal dock sync (สำคัญ) ----
+  // ---- horizontal dock sync ----
   let hsyncLock = false;
 
   function syncHScrollGeometry(){
@@ -635,8 +762,6 @@ for(let i = 0; i < snowflakeCount; i++){
     const bar = el("hScrollBar");
     const inner = el("hScrollInner");
     const table = el("resultTable");
-
-    // ถ้า HTML ยังไม่มี dock ก็ไม่พัง (เงียบ ๆ)
     if(!wrap || !dock || !bar || !inner || !table) return;
 
     const scrollW = wrap.scrollWidth;
@@ -677,21 +802,93 @@ for(let i = 0; i < snowflakeCount; i++){
     window.addEventListener("resize", () => syncHScrollGeometry());
   }
 
-  // ---- UI helpers ----
+  // =========================================================
+  // ✅ Pre-upload filter controls
+  // =========================================================
+  function toggleChip(btn, isOn){
+    if(!btn) return;
+    btn.classList.toggle("active", !!isOn);
+  }
+
+  function syncFilterChipsUI(){
+    document.querySelectorAll("[data-client]").forEach((b) => {
+      const tag = String(b.getAttribute("data-client") || "").toUpperCase();
+      toggleChip(b, state.clientFilters.has(tag));
+    });
+    document.querySelectorAll("[data-platform]").forEach((b) => {
+      const p = String(b.getAttribute("data-platform") || "").toUpperCase();
+      toggleChip(b, state.platformFilters.has(p));
+    });
+  }
+
   function setButtonsEnabled(hasFiles){
     el("btnUpload").disabled = !hasFiles;
     el("btnClear").disabled = !hasFiles;
   }
 
-  function setUploadInfo(){
+  function setUploadInfo(extraNote = ""){
     const info = el("uploadInfo");
     if(!info) return;
+
     if(!state.files.length){
       info.textContent = "ยังไม่ได้เลือกไฟล์";
-    }else{
-      const size = state.files.reduce((a,f) => a + (f.size||0), 0);
-      info.textContent = `${state.files.length} ไฟล์ · ${(size/1024/1024).toFixed(2)} MB`;
+      return;
     }
+
+    const size = state.files.reduce((a,f) => a + (f.size||0), 0);
+    const base = `${state.files.length} ไฟล์ · ${(size/1024/1024).toFixed(2)} MB`;
+    info.textContent = extraNote ? `${base} · ${extraNote}` : base;
+  }
+
+  function prefilterFilesBeforeUpload(files){
+    const doClient = state.clientFilters.size > 0;
+    const doPlat = state.platformFilters.size > 0;
+
+    if(!doClient && !doPlat){
+      return { kept: files, skipped: [], note: "" };
+    }
+
+    const kept = [];
+    const skipped = [];
+
+    for(const f of files){
+      const fname = f?.name || "";
+      const c = inferClientTagFromFilename(fname); // null if unknown
+      const p = inferPlatformFromFilename(fname);  // OTHER if unknown
+
+      let ok = true;
+
+      // client:
+      // - infer ได้ + ไม่อยู่ใน filter => skip
+      // - infer ไม่ได้ => allow (กันตัดผิด)
+      if(doClient && c){
+        if(!state.clientFilters.has(String(c).toUpperCase())) ok = false;
+      }
+
+      // platform:
+      // - ถ้า infer ได้เป็นแพลตฟอร์มหลัก (ไม่ใช่ OTHER) และไม่อยู่ใน filter => skip
+      // - ถ้า OTHER/เดาไม่ได้ => allow (กันตัดผิด)
+      if(doPlat && p && p !== "OTHER"){
+        if(!state.platformFilters.has(String(p).toUpperCase())) ok = false;
+      }
+
+      if(ok) kept.push(f);
+      else skipped.push(f);
+    }
+
+    const note = skipped.length ? `ข้าม ${skipped.length} ไฟล์ (ไม่ตรง filter)` : "";
+    return { kept, skipped, note };
+  }
+
+  function currentJobCfgFromFilters(){
+    const clientTags = Array.from(state.clientFilters);
+    const platforms = Array.from(state.platformFilters);
+
+    const clientTaxIds = clientTags
+      .map(t => CLIENTS[t]?.taxId)
+      .filter(Boolean);
+
+    return { clientTags, clientTaxIds, platforms, savedAt: nowISO() };
   }
 
   // ---- bind ----
@@ -710,18 +907,15 @@ for(let i = 0; i < snowflakeCount; i++){
     if(backendUrlInput) backendUrlInput.value = state.backendUrl;
     if(backendSelect) backendSelect.value = state.backendUrl;
 
-    // ถ้ามี dropdown → เปลี่ยนแล้ว sync ไปที่ input
     backendSelect?.addEventListener("change", () => {
       setBackendUrl(backendSelect.value);
       if(backendUrlInput) backendUrlInput.value = state.backendUrl;
     });
 
-    // ถ้ามี input → ยังให้แก้เองได้ (ตามโค้ดคุณ)
     backendUrlInput?.addEventListener("change", (e) => {
       setBackendUrl(e.target.value);
       if(backendSelect){
         const v = state.backendUrl;
-        // ถ้าตรง preset ก็ sync dropdown ให้
         if(v === DEFAULT_BACKEND || v === "http://localhost:8000"){
           backendSelect.value = v;
         }
@@ -729,12 +923,55 @@ for(let i = 0; i < snowflakeCount; i++){
     });
 
     // =========================================================
+    // ✅ Settings chips
+    // =========================================================
+    document.querySelectorAll("[data-client]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const tag = String(btn.getAttribute("data-client") || "").toUpperCase();
+        if(!tag) return;
+        if(state.clientFilters.has(tag)) state.clientFilters.delete(tag);
+        else state.clientFilters.add(tag);
+        syncFilterChipsUI();
+      });
+    });
+
+    document.querySelectorAll("[data-platform]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const p = String(btn.getAttribute("data-platform") || "").toUpperCase();
+        if(!p) return;
+        if(state.platformFilters.has(p)) state.platformFilters.delete(p);
+        else state.platformFilters.add(p);
+        syncFilterChipsUI();
+      });
+    });
+
+    el("btnClientAll")?.addEventListener("click", () => {
+      Object.keys(CLIENTS).forEach(k => state.clientFilters.add(k));
+      syncFilterChipsUI();
+    });
+    el("btnClientClear")?.addEventListener("click", () => {
+      state.clientFilters.clear();
+      syncFilterChipsUI();
+    });
+
+    el("btnPlatformAll")?.addEventListener("click", () => {
+      Object.keys(PLATFORMS).forEach(k => state.platformFilters.add(k));
+      syncFilterChipsUI();
+    });
+    el("btnPlatformClear")?.addEventListener("click", () => {
+      state.platformFilters.clear();
+      syncFilterChipsUI();
+    });
+
+    syncFilterChipsUI();
+
+    // =========================================================
     // ✅ File picker
     // =========================================================
-    el("btnPick").addEventListener("click", () => el("file").click());
+    el("btnPick")?.addEventListener("click", () => el("file").click());
 
     const fileInput = el("file");
-    fileInput.addEventListener("change", () => {
+    fileInput?.addEventListener("change", () => {
       state.files = Array.from(fileInput.files || []);
       setButtonsEnabled(state.files.length > 0);
       setUploadInfo();
@@ -742,9 +979,9 @@ for(let i = 0; i < snowflakeCount; i++){
 
     // drag drop
     const drop = el("drop");
-    drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("isOver"); });
-    drop.addEventListener("dragleave", () => drop.classList.remove("isOver"));
-    drop.addEventListener("drop", (e) => {
+    drop?.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("isOver"); });
+    drop?.addEventListener("dragleave", () => drop.classList.remove("isOver"));
+    drop?.addEventListener("drop", (e) => {
       e.preventDefault();
       drop.classList.remove("isOver");
       const files = Array.from(e.dataTransfer?.files || []);
@@ -761,7 +998,7 @@ for(let i = 0; i < snowflakeCount; i++){
     });
 
     // upload
-    el("btnUpload").addEventListener("click", async () => {
+    el("btnUpload")?.addEventListener("click", async () => {
       if(!state.files.length) return;
 
       setEditMode(false);
@@ -771,15 +1008,36 @@ for(let i = 0; i < snowflakeCount; i++){
       state.rows = [];
       renderTable();
 
+      // ✅ pre-filter ก่อนส่งขึ้น backend
+      const { kept, skipped, note } = prefilterFilesBeforeUpload(state.files);
+
+      if(!kept.length){
+        alert("ไม่มีไฟล์ที่ตรงกับ Filter ที่เลือก (ทุกไฟล์ถูกข้ามหมด)\nลองกด Clear หรือเลือกบริษัท/แพลตฟอร์มใหม่");
+        el("btnUpload").disabled = false;
+        return;
+      }
+
+      setUploadInfo(note);
+
       el("jobMeta").textContent = "uploading...";
-      setProgressUI({ processed_files: 0, total_files: state.files.length, ok_files: 0, review_files: 0, state: "uploading" });
+      setProgressUI({ processed_files: 0, total_files: kept.length, ok_files: 0, review_files: 0, state: "uploading" });
 
       const fd = new FormData();
-      state.files.forEach((f) => fd.append("files", f, f.name));
+      kept.forEach((f) => fd.append("files", f, f.name));
+
+      // ✅ แนบ settings เพิ่ม (backend จะ ignore ก็ไม่พัง)
+      const cfg = currentJobCfgFromFilters();
+      fd.append("client_tags", (cfg.clientTags || []).join(","));
+      fd.append("client_tax_ids", (cfg.clientTaxIds || []).join(","));
+      fd.append("platforms", (cfg.platforms || []).join(","));
 
       try{
         const res = await (await api("/api/upload", { method: "POST", body: fd })).json();
         state.jobId = res.job_id;
+
+        // ✅ เก็บ cfg ของงานนี้ เพื่อเติม "ชื่อบริษัท" แม่นขึ้น
+        saveJobCfg(state.backendUrl, state.jobId, cfg);
+        state.jobConfig = cfg;
 
         el("jobMeta").textContent = `job_id=${state.jobId} · processing...`;
         el("btnCsv").disabled = true;
@@ -797,7 +1055,7 @@ for(let i = 0; i < snowflakeCount; i++){
       }
     });
 
-    el("btnClear").addEventListener("click", () => {
+    el("btnClear")?.addEventListener("click", () => {
       setEditMode(false);
       state.files = [];
       state.jobId = null;
@@ -815,10 +1073,10 @@ for(let i = 0; i < snowflakeCount; i++){
       renderTable();
     });
 
-    // filter chips
-    document.querySelectorAll(".chip").forEach((btn) => {
+    // filter chips (ผลลัพธ์)
+    document.querySelectorAll(".chip[data-filter]").forEach((btn) => {
       btn.addEventListener("click", () => {
-        document.querySelectorAll(".chip").forEach(b => b.classList.remove("active"));
+        document.querySelectorAll(".chip[data-filter]").forEach(b => b.classList.remove("active"));
         btn.classList.add("active");
         state.filter = btn.dataset.filter || "all";
         renderTable();
@@ -826,33 +1084,33 @@ for(let i = 0; i < snowflakeCount; i++){
     });
 
     // search
-    el("q").addEventListener("input", (e) => {
+    el("q")?.addEventListener("input", (e) => {
       state.q = e.target.value.trim();
       renderTable();
     });
 
     // export raw
-    el("btnCsv").addEventListener("click", () => {
+    el("btnCsv")?.addEventListener("click", () => {
       if(!state.jobId) return;
       window.open(`${state.backendUrl}/api/export/${state.jobId}.csv`, "_blank");
     });
-    el("btnXlsx").addEventListener("click", () => {
+    el("btnXlsx")?.addEventListener("click", () => {
       if(!state.jobId) return;
       window.open(`${state.backendUrl}/api/export/${state.jobId}.xlsx`, "_blank");
     });
 
     // export edited
-    el("btnCsvEdited").addEventListener("click", () => {
+    el("btnCsvEdited")?.addEventListener("click", () => {
       if(state.editMode) readEditsFromDOM();
       exportEditedCSV();
     });
-    el("btnXlsxEdited").addEventListener("click", () => {
+    el("btnXlsxEdited")?.addEventListener("click", () => {
       if(state.editMode) readEditsFromDOM();
       exportEditedXLSX();
     });
 
     // edit mode
-    el("btnEdit").addEventListener("click", () => {
+    el("btnEdit")?.addEventListener("click", () => {
       if(!state.rows.length){
         alert("ยังไม่มีข้อมูลให้แก้ไข");
         return;
@@ -860,17 +1118,17 @@ for(let i = 0; i < snowflakeCount; i++){
       setEditMode(!state.editMode);
     });
 
-    el("btnSave").addEventListener("click", () => {
+    el("btnSave")?.addEventListener("click", () => {
       if(!state.editMode) return;
       saveEditsNow();
     });
 
     // history
-    el("btnHistory").addEventListener("click", openModal);
-    el("btnClearHistory").addEventListener("click", () => {
+    el("btnHistory")?.addEventListener("click", openModal);
+    el("btnClearHistory")?.addEventListener("click", () => {
       if(confirm("ล้างประวัติทั้งหมด?")) clearHistory();
     });
-    el("historyModal").addEventListener("click", (e) => {
+    el("historyModal")?.addEventListener("click", (e) => {
       const t = e.target;
       if(t && t.getAttribute && t.getAttribute("data-close") === "1") closeModal();
     });
@@ -888,7 +1146,7 @@ for(let i = 0; i < snowflakeCount; i++){
     syncHScrollGeometry();
   }
 
-  // ✅ ให้เริ่มทุกอย่างหลัง DOM พร้อม + เริ่มหิมะด้วย
+  // ✅ start
   document.addEventListener("DOMContentLoaded", () => {
     bind();
     initSnow();

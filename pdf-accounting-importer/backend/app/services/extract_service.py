@@ -4,6 +4,7 @@ from typing import Dict, Any, Tuple, List, Callable
 import os
 import logging
 import inspect
+import re
 
 from .classifier import classify_platform
 
@@ -18,7 +19,7 @@ try:
 except Exception:  # pragma: no cover
     extract_spx = None  # type: ignore
 
-# ✅ NEW: vendor code mapping (Cxxxxx)
+# ✅ vendor code mapping (Cxxxxx)
 try:
     from ..extractors.vendor_mapping import get_vendor_code, detect_client_from_context
     _VENDOR_MAPPING_OK = True
@@ -42,8 +43,10 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # 🔥 PEAK columns lock (A-U) — อย่าให้คอลัมน์เลื่อนอีก
 # ============================================================
+# ✅ เพิ่ม A_company_name ต่อจาก A_seq
 PEAK_KEYS_ORDER: List[str] = [
     "A_seq",
+    "A_company_name",
     "B_doc_date",
     "C_reference",
     "D_vendor_code",
@@ -72,6 +75,10 @@ _AI_BLACKLIST_KEYS = {"T_note", "U_group", "K_account"}
 # คีย์ภายในที่อนุญาตให้ผ่านได้ (metadata)
 _INTERNAL_OK_PREFIXES = ("_",)
 
+# ✅ whitespace compact for ref/invoice
+_RE_ALL_WS = re.compile(r"\s+")
+
+
 # ============================================================
 # helpers: safe merge + sanitize
 # ============================================================
@@ -81,11 +88,23 @@ def _sanitize_incoming_row(d: Any) -> Dict[str, Any]:
     return d if isinstance(d, dict) else {}
 
 
+def _compact_no_ws(v: Any) -> str:
+    """
+    ✅ ตัด whitespace ทั้งหมด (space/newline/tab) ให้ token ติดกัน
+    เช่น "RCSPX...-25 1218-0001" -> "RCSPX...-251218-0001"
+    """
+    s = "" if v is None else str(v)
+    s = s.strip()
+    if not s:
+        return ""
+    return _RE_ALL_WS.sub("", s)
+
+
 def _sanitize_ai_row(ai: Dict[str, Any]) -> Dict[str, Any]:
     """
     - ตัด key ต้องห้าม: T_note, U_group, K_account
     - ตัด None/"" ออก
-    - รับเฉพาะ key ที่อยู่ใน PEAK A-U หรือเป็น _meta
+    - รับเฉพาะ key ที่อยู่ใน PEAK_KEYS_ORDER หรือเป็น _meta
     """
     if not ai:
         return {}
@@ -99,17 +118,17 @@ def _sanitize_ai_row(ai: Dict[str, Any]) -> Dict[str, Any]:
         if v in ("", None):
             continue
 
-        # allow PEAK keys
+        # allow PEAK keys (รวม A_company_name ด้วยแล้ว)
         if k in PEAK_KEYS_ORDER:
             cleaned[k] = v
             continue
 
         # allow internal meta keys
-        if k.startswith(_INTERNAL_OK_PREFIXES):
+        if isinstance(k, str) and k.startswith(_INTERNAL_OK_PREFIXES):
             cleaned[k] = v
             continue
 
-        # ignore everything else to prevent column shift / garbage keys
+        # ignore everything else
         continue
 
     return cleaned
@@ -222,18 +241,12 @@ def _safe_call_extractor(
 
 
 # ============================================================
-# ✅ NEW: Vendor code mapping pass (force D_vendor_code = Cxxxxx)
+# ✅ Vendor code mapping pass (force D_vendor_code = Cxxxxx)
 # ============================================================
 
 def _apply_vendor_code_mapping(row: Dict[str, Any], text: str, client_tax_id: str) -> Dict[str, Any]:
     """
     Force D_vendor_code to be Cxxxxx using vendor_mapping.py
-
-    Rules:
-    - client_tax_id: use provided; if missing, try detect_client_from_context(text)
-    - vendor_tax_id: use row["E_tax_id_13"]
-    - vendor_name hint: use current row["D_vendor_code"] (often "Shopee"/"SPX")
-    - NEVER leave platform name if mapping is possible
     """
     if not isinstance(row, dict):
         return row
@@ -249,7 +262,6 @@ def _apply_vendor_code_mapping(row: Dict[str, Any], text: str, client_tax_id: st
             ctax = ""
 
     if not ctax:
-        # can't map without knowing our company
         return row
 
     vtax = str(row.get("E_tax_id_13") or "").strip()
@@ -260,10 +272,8 @@ def _apply_vendor_code_mapping(row: Dict[str, Any], text: str, client_tax_id: st
     except Exception:
         return row
 
-    # apply only when it looks like a real C-code
     if isinstance(code, str) and code.startswith("C") and len(code) >= 5:
         row["D_vendor_code"] = code
-        # optional meta for debugging
         if os.getenv("STORE_VENDOR_MAPPING_META", "1") == "1":
             row["_client_tax_id_used"] = ctax
             row["_vendor_tax_id_used"] = vtax or ""
@@ -278,7 +288,7 @@ def _apply_vendor_code_mapping(row: Dict[str, Any], text: str, client_tax_id: st
 
 def lock_peak_columns(row: Dict[str, Any]) -> Dict[str, Any]:
     """
-    1) ล็อกให้มีแต่คอลัมน์ PEAK A-U + _meta
+    1) ล็อกให้มีแต่คอลัมน์ PEAK + _meta
     2) ใส่คีย์ที่ขาดให้ครบด้วยค่า "" (กัน CSV/Excel เลื่อน)
     3) ห้ามเอา key แปลก ๆ มาปน
     """
@@ -291,7 +301,7 @@ def lock_peak_columns(row: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(k, str) and k.startswith(_INTERNAL_OK_PREFIXES):
             out[k] = v
 
-    # Lock PEAK keys
+    # Lock PEAK keys (รวม A_company_name แล้ว)
     for k in PEAK_KEYS_ORDER:
         out[k] = safe.get(k, "")
 
@@ -311,7 +321,6 @@ def enforce_marketplace_group(row: Dict[str, Any], platform: str) -> Dict[str, A
     if is_marketplace:
         row["U_group"] = "Marketplace Expense"
 
-        # กัน case ที่เคยเลื่อน: Marketplace Expense ไปอยู่ K_account
         if str(row.get("K_account", "") or "").strip() == "Marketplace Expense":
             row["K_account"] = ""
 
@@ -321,11 +330,15 @@ def enforce_marketplace_group(row: Dict[str, Any], platform: str) -> Dict[str, A
 def _finalize_row(row: Dict[str, Any], platform: str) -> Dict[str, Any]:
     """
     Final sanitize:
+    - P_wht ว่าง (คุณไม่ต้องการบันทึก)
     - T_note ว่าง
-    - sync C/G
+    - sync C/G + compact no whitespace
     - force U_group rule
     - lock schema
     """
+    # ✅ WHT must be empty (requirement #5)
+    row["P_wht"] = ""
+
     # ✅ notes must be empty
     if os.getenv("FORCE_EMPTY_NOTE", "1") == "1":
         row["T_note"] = ""
@@ -335,6 +348,10 @@ def _finalize_row(row: Dict[str, Any], platform: str) -> Dict[str, Any]:
         row["C_reference"] = row.get("G_invoice_no", "")
     if not row.get("G_invoice_no") and row.get("C_reference"):
         row["G_invoice_no"] = row.get("C_reference", "")
+
+    # ✅ compact reference / invoice (requirement #6)
+    row["C_reference"] = _compact_no_ws(row.get("C_reference", ""))
+    row["G_invoice_no"] = _compact_no_ws(row.get("G_invoice_no", ""))
 
     # ✅ enforce marketplace group last
     row = enforce_marketplace_group(row, platform)
@@ -396,10 +413,9 @@ def extract_row_from_text(
 
     row = _sanitize_incoming_row(row)
 
-    # 3) AI ENHANCEMENT (SAFE + blacklist + key filter)
+    # 3) AI ENHANCEMENT
     if os.getenv("ENABLE_AI_EXTRACT", "0") == "1":
         try:
-            # ✅ ส่ง client_tax_id ให้ AI ถ้า service รองรับ (รองรับ/ไม่รองรับก็ไม่ล่ม)
             try:
                 ai_raw = extract_with_ai(text, filename=filename, client_tax_id=client_tax_id)
             except TypeError:
@@ -415,7 +431,7 @@ def extract_row_from_text(
     # 4) validate
     errors = _validate_row(row)
 
-    # 5) AI REPAIR PASS (SAFE + blacklist + key filter)
+    # 5) AI REPAIR PASS
     if errors and os.getenv("AI_REPAIR_PASS", "0") == "1":
         try:
             prompt = text + "\n\n# VALIDATION_ERRORS\n" + "\n".join(errors)
@@ -425,20 +441,16 @@ def extract_row_from_text(
                 ai_fix_raw = extract_with_ai(prompt, filename=filename)
 
             ai_fix = _sanitize_ai_row(_sanitize_incoming_row(ai_fix_raw))
-
-            # repair pass = allow overwrite but still respect blacklist
             row = _merge_rows(row, ai_fix, fill_missing=False)
-
             errors = _validate_row(row)
         except Exception as e:
             logger.warning("AI repair failed (file=%s): %s", filename, e)
             _record_ai_error(row, "ai_repair", e)
 
-    # 6) ✅ Vendor code mapping pass (MUST happen before finalize/lock)
-    # This is what forces D_vendor_code to be Cxxxxx (e.g., SHD+Shopee => C00888)
+    # 6) ✅ Vendor code mapping pass (ก่อน finalize/lock)
     row = _apply_vendor_code_mapping(row, text, client_tax_id)
 
-    # 7) FINALIZE (🔥 จุดกันคอลัมน์เลื่อน)
+    # 7) FINALIZE (กันเลื่อน + compact + P_wht empty)
     row = _finalize_row(row, platform)
 
     return platform, row, errors

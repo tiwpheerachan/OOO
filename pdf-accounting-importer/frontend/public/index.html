@@ -1,4 +1,4 @@
-<!doctype html>
+<!doctype html> 
 <html lang="th">
 <head>
   <meta charset="utf-8" />
@@ -42,6 +42,45 @@
         <div class="field">
           <label>เชื่อมต่อ API (แก้ไขเองได้)</label>
           <input id="backendUrl" placeholder="https://ai-1-dq7u.onrender.com" />
+        </div>
+      </div>
+
+      <!-- ✅ NEW: Settings / Pre-upload filter -->
+      <div class="card">
+        <div class="h">0) Settings (Pre-Upload Filter)</div>
+
+        <div class="field" style="margin-top:0">
+          <label>บริษัท (เลือกได้หลายอัน) · ไม่เลือก = ทุกบริษัท</label>
+          <div class="chipRow" id="clientChips">
+            <button type="button" class="chip" data-client="SHD">SHD</button>
+            <button type="button" class="chip" data-client="TOPONE">TOPONE</button>
+            <button type="button" class="chip" data-client="RABBIT">RABBIT</button>
+            <button type="button" class="chip" data-client="HASHTAG">HASHTAG</button>
+
+            <button type="button" class="chip ghost" id="btnClientAll">All</button>
+            <button type="button" class="chip ghost" id="btnClientClear">Clear</button>
+          </div>
+          <div class="muted tiny" style="margin-top:6px">
+            CLIENT_RABBIT=0105561071873 · CLIENT_SHD=0105563022918 · CLIENT_TOPONE=0105565027615
+          </div>
+        </div>
+
+        <div class="field">
+          <label>Platform (เลือกได้หลายอัน) · ไม่เลือก = ทุกแพลตฟอร์ม</label>
+          <div class="chipRow" id="platformChips">
+            <button type="button" class="chip" data-platform="SHOPEE">SHOPEE</button>
+            <button type="button" class="chip" data-platform="LAZADA">LAZADA</button>
+            <button type="button" class="chip" data-platform="TIKTOK">TIKTOK</button>
+            <button type="button" class="chip" data-platform="SPX">SPX</button>
+            <button type="button" class="chip" data-platform="FACEBOOK">FACEBOOK</button>
+            <button type="button" class="chip" data-platform="OTHER">OTHER</button>
+
+            <button type="button" class="chip ghost" id="btnPlatformAll">All</button>
+            <button type="button" class="chip ghost" id="btnPlatformClear">Clear</button>
+          </div>
+          <div class="muted tiny" style="margin-top:6px">
+            * กรองด้วยชื่อไฟล์ก่อนอัปโหลด (best-effort)
+          </div>
         </div>
       </div>
 
@@ -226,35 +265,32 @@
         const snowflakes = ["❄","❅","❆"];
         const count = Number(snowflakeCount || 50);
 
-for(let i = 0; i < snowflakeCount; i++){
-  const snowflake = document.createElement("div");
-  snowflake.className = "snowflake";
-  snowflake.textContent = snowflakes[Math.floor(Math.random() * snowflakes.length)];
+        for(let i = 0; i < count; i++){
+          const snowflake = document.createElement("div");
+          snowflake.className = "snowflake";
+          snowflake.textContent = snowflakes[Math.floor(Math.random() * snowflakes.length)];
 
-  const left = Math.random() * 100;
-  const delay = Math.random() * 6;
-  const duration = 7 + Math.random() * 9;
-  const drift = (Math.random() - 0.5) * 70;   // ✅ ดริฟต์น้อยลง
-  const size = 9 + Math.random() * 5;         // ✅ เล็กลง
-  const opacity = 0.25 + Math.random() * 0.35;
+          const left = Math.random() * 100;
+          const delay = Math.random() * 6;
+          const duration = 7 + Math.random() * 9;
+          const drift = (Math.random() - 0.5) * 70;
+          const size = 9 + Math.random() * 5;
+          const opacity = 0.25 + Math.random() * 0.35;
+          const topStart = -18 - Math.random() * 40;
 
-  const topStart = -18 - Math.random() * 40;  // ✅ เพิ่มบรรทัดนี้
+          snowflake.style.left = `${left}%`;
+          snowflake.style.top = `${topStart}px`;
+          snowflake.style.animationDelay = `${delay}s`;
+          snowflake.style.animationDuration = `${duration}s`;
+          snowflake.style.setProperty("--drift", `${drift}px`);
+          snowflake.style.fontSize = `${size}px`;
+          snowflake.style.opacity = `${opacity}`;
 
-  snowflake.style.left = `${left}%`;
-  snowflake.style.top = `${topStart}px`;      // ✅ เพิ่มบรรทัดนี้
-  snowflake.style.animationDelay = `${delay}s`;
-  snowflake.style.animationDuration = `${duration}s`;
-  snowflake.style.setProperty("--drift", `${drift}px`);
-  snowflake.style.fontSize = `${size}px`;
-  snowflake.style.opacity = `${opacity}`;
-
-  snowContainer.appendChild(snowflake);
-}
-
+          snowContainer.appendChild(snowflake);
+        }
       }
 
       window.addEventListener("load", function(){
-        // ทำให้แน่ใจว่าหิมะเริ่มหลังโหลดเสร็จ
         createSnowflakes("snowBackend", 20);
       });
     })();
