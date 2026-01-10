@@ -36,14 +36,19 @@ from ..utils.validators import (
     validate_vat_rate,
 )
 
-from .ai_extract_service import extract_with_ai
+# ✅ AI extractor (optional)
+try:
+    from .ai_extract_service import extract_with_ai
+    _AI_OK = True
+except Exception:  # pragma: no cover
+    extract_with_ai = None  # type: ignore
+    _AI_OK = False
 
 logger = logging.getLogger(__name__)
 
 # ============================================================
 # 🔥 PEAK columns lock (A-U) — อย่าให้คอลัมน์เลื่อนอีก
 # ============================================================
-# ✅ เพิ่ม A_company_name ต่อจาก A_seq
 PEAK_KEYS_ORDER: List[str] = [
     "A_seq",
     "A_company_name",
@@ -78,7 +83,6 @@ _INTERNAL_OK_PREFIXES = ("_",)
 # ✅ whitespace compact for ref/invoice
 _RE_ALL_WS = re.compile(r"\s+")
 
-
 # ============================================================
 # helpers: safe merge + sanitize
 # ============================================================
@@ -86,7 +90,6 @@ _RE_ALL_WS = re.compile(r"\s+")
 def _sanitize_incoming_row(d: Any) -> Dict[str, Any]:
     """รับเฉพาะ dict เท่านั้น"""
     return d if isinstance(d, dict) else {}
-
 
 def _compact_no_ws(v: Any) -> str:
     """
@@ -98,7 +101,6 @@ def _compact_no_ws(v: Any) -> str:
     if not s:
         return ""
     return _RE_ALL_WS.sub("", s)
-
 
 def _sanitize_ai_row(ai: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -118,21 +120,15 @@ def _sanitize_ai_row(ai: Dict[str, Any]) -> Dict[str, Any]:
         if v in ("", None):
             continue
 
-        # allow PEAK keys (รวม A_company_name ด้วยแล้ว)
         if k in PEAK_KEYS_ORDER:
             cleaned[k] = v
             continue
 
-        # allow internal meta keys
         if isinstance(k, str) and k.startswith(_INTERNAL_OK_PREFIXES):
             cleaned[k] = v
             continue
 
-        # ignore everything else
-        continue
-
     return cleaned
-
 
 def _merge_rows(
     base: Dict[str, Any],
@@ -167,7 +163,6 @@ def _merge_rows(
 
     return out
 
-
 # ============================================================
 # helpers: validation
 # ============================================================
@@ -197,7 +192,6 @@ def _validate_row(row: Dict[str, Any]) -> List[str]:
         errors.append("อัตราภาษีไม่ถูกต้อง")
 
     return errors
-
 
 # ============================================================
 # helpers: extractor call (backward compatible)
@@ -230,7 +224,6 @@ def _safe_call_extractor(
     except Exception:
         pass
 
-    # fallback tries
     if client_tax_id:
         try:
             return fn(text, client_tax_id=client_tax_id)  # type: ignore
@@ -238,7 +231,6 @@ def _safe_call_extractor(
             pass
 
     return fn(text)  # type: ignore
-
 
 # ============================================================
 # ✅ Vendor code mapping pass (force D_vendor_code = Cxxxxx)
@@ -281,7 +273,6 @@ def _apply_vendor_code_mapping(row: Dict[str, Any], text: str, client_tax_id: st
 
     return row
 
-
 # ============================================================
 # 🔥 FINAL LOCK: force PEAK schema + fix Marketplace group
 # ============================================================
@@ -293,7 +284,6 @@ def lock_peak_columns(row: Dict[str, Any]) -> Dict[str, Any]:
     3) ห้ามเอา key แปลก ๆ มาปน
     """
     safe = _sanitize_incoming_row(row)
-
     out: Dict[str, Any] = {}
 
     # Keep internal meta first
@@ -301,12 +291,11 @@ def lock_peak_columns(row: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(k, str) and k.startswith(_INTERNAL_OK_PREFIXES):
             out[k] = v
 
-    # Lock PEAK keys (รวม A_company_name แล้ว)
+    # Lock PEAK keys
     for k in PEAK_KEYS_ORDER:
         out[k] = safe.get(k, "")
 
     return out
-
 
 def enforce_marketplace_group(row: Dict[str, Any], platform: str) -> Dict[str, Any]:
     """
@@ -320,12 +309,10 @@ def enforce_marketplace_group(row: Dict[str, Any], platform: str) -> Dict[str, A
     is_marketplace = p in ("shopee", "lazada", "tiktok", "spx") or (desc == "Marketplace Expense")
     if is_marketplace:
         row["U_group"] = "Marketplace Expense"
-
         if str(row.get("K_account", "") or "").strip() == "Marketplace Expense":
             row["K_account"] = ""
 
     return row
-
 
 def _finalize_row(row: Dict[str, Any], platform: str) -> Dict[str, Any]:
     """
@@ -336,7 +323,7 @@ def _finalize_row(row: Dict[str, Any], platform: str) -> Dict[str, Any]:
     - force U_group rule
     - lock schema
     """
-    # ✅ WHT must be empty (requirement #5)
+    # ✅ WHT must be empty (your export requirement)
     row["P_wht"] = ""
 
     # ✅ notes must be empty
@@ -349,7 +336,7 @@ def _finalize_row(row: Dict[str, Any], platform: str) -> Dict[str, Any]:
     if not row.get("G_invoice_no") and row.get("C_reference"):
         row["G_invoice_no"] = row.get("C_reference", "")
 
-    # ✅ compact reference / invoice (requirement #6)
+    # ✅ compact reference / invoice
     row["C_reference"] = _compact_no_ws(row.get("C_reference", ""))
     row["G_invoice_no"] = _compact_no_ws(row.get("G_invoice_no", ""))
 
@@ -361,7 +348,6 @@ def _finalize_row(row: Dict[str, Any], platform: str) -> Dict[str, Any]:
 
     return row
 
-
 def _record_ai_error(row: Dict[str, Any], stage: str, exc: Exception) -> None:
     if os.getenv("STORE_AI_ERROR_META", "1") != "1":
         return
@@ -372,7 +358,6 @@ def _record_ai_error(row: Dict[str, Any], stage: str, exc: Exception) -> None:
         arr = []
     arr.append(msg)
     row["_ai_errors"] = arr
-
 
 # ============================================================
 # 🔥 MAIN ENTRY
@@ -387,12 +372,23 @@ def extract_row_from_text(
     return: platform, row, errors
     """
 
-    # 1) classify
+    # 0) normalize inputs (safe)
+    text = text or ""
+    filename = filename or ""
+    client_tax_id = (client_tax_id or "").strip()
+
+    # 1) classify (✅ MUST pass filename)
     try:
-        platform = classify_platform(text)
+        platform = classify_platform(text, filename=filename)
     except Exception as e:
         logger.exception("classify_platform failed: %s", e)
-        platform = "generic"
+        platform = "unknown"
+
+    # 1.1) normalize platform label (defensive)
+    # classifier returns: shopee/lazada/tiktok/spx/ads/other/unknown
+    # we route "other/unknown" -> generic extractor
+    if platform not in ("shopee", "lazada", "tiktok", "spx", "ads", "other", "unknown"):
+        platform = "unknown"
 
     # 2) extractor baseline
     try:
@@ -402,20 +398,41 @@ def extract_row_from_text(
             row = _safe_call_extractor(extract_lazada, text, filename=filename, client_tax_id=client_tax_id)
         elif platform == "tiktok":
             row = _safe_call_extractor(extract_tiktok, text, filename=filename, client_tax_id=client_tax_id)
-        elif platform == "spx" and extract_spx is not None:
-            row = _safe_call_extractor(extract_spx, text, filename=filename, client_tax_id=client_tax_id)
+        elif platform == "spx":
+            if extract_spx is not None:
+                row = _safe_call_extractor(extract_spx, text, filename=filename, client_tax_id=client_tax_id)
+            else:
+                # if spx extractor missing, fallback to generic but keep meta
+                row = _safe_call_extractor(extract_generic, text, filename=filename, client_tax_id=client_tax_id)
+                row["_missing_extractor"] = "spx"
         else:
+            # ads/other/unknown -> generic
             row = _safe_call_extractor(extract_generic, text, filename=filename, client_tax_id=client_tax_id)
     except Exception as e:
         logger.exception("Extractor error (platform=%s, file=%s)", platform, filename)
-        row = extract_generic(text)
+        row = _sanitize_incoming_row(extract_generic(text))
         row["_extractor_error"] = f"{type(e).__name__}: {str(e)}"[:500]
 
     row = _sanitize_incoming_row(row)
 
-    # 3) AI ENHANCEMENT
-    if os.getenv("ENABLE_AI_EXTRACT", "0") == "1":
+    # 2.1) ensure minimal stable defaults BEFORE AI/validate (ลด error noise)
+    row.setdefault("A_seq", "")
+    row.setdefault("A_company_name", "")
+    row.setdefault("J_price_type", row.get("J_price_type") or "1")
+    row.setdefault("M_qty", row.get("M_qty") or "1")
+    row.setdefault("O_vat_rate", row.get("O_vat_rate") or "7%")
+    row.setdefault("L_description", row.get("L_description") or ("Marketplace Expense" if platform in ("shopee", "lazada", "tiktok", "spx") else ""))
+    row.setdefault("U_group", row.get("U_group") or ("Marketplace Expense" if platform in ("shopee", "lazada", "tiktok", "spx") else ""))
+
+    # store meta for debug (optional)
+    if os.getenv("STORE_CLASSIFIER_META", "1") == "1":
+        row["_platform"] = platform
+        row["_filename"] = filename
+
+    # 3) AI ENHANCEMENT (optional + must be safe)
+    if _AI_OK and extract_with_ai is not None and os.getenv("ENABLE_AI_EXTRACT", "0") == "1":
         try:
+            # attempt with client_tax_id if supported
             try:
                 ai_raw = extract_with_ai(text, filename=filename, client_tax_id=client_tax_id)
             except TypeError:
@@ -431,10 +448,10 @@ def extract_row_from_text(
     # 4) validate
     errors = _validate_row(row)
 
-    # 5) AI REPAIR PASS
-    if errors and os.getenv("AI_REPAIR_PASS", "0") == "1":
+    # 5) AI REPAIR PASS (optional)
+    if errors and _AI_OK and extract_with_ai is not None and os.getenv("AI_REPAIR_PASS", "0") == "1":
         try:
-            prompt = text + "\n\n# VALIDATION_ERRORS\n" + "\n".join(errors)
+            prompt = (text or "") + "\n\n# VALIDATION_ERRORS\n" + "\n".join(errors)
             try:
                 ai_fix_raw = extract_with_ai(prompt, filename=filename, client_tax_id=client_tax_id)
             except TypeError:

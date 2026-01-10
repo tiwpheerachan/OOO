@@ -4,12 +4,15 @@ import io
 import os
 import json
 import inspect
+import logging
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
+
+logger = logging.getLogger(__name__)
 
 # =========================
 # ✅ Load .env intelligently
@@ -88,6 +91,11 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
         "message": str(exc) if debug else "Internal server error",
         "path": str(request.url),
     }
+    # ✅ log always (so you can see why state=error)
+    try:
+        logger.exception("Unhandled error: %s %s", request.method, request.url)
+    except Exception:
+        pass
     return JSONResponse(status_code=500, content=payload)
 
 # =========================
@@ -139,7 +147,7 @@ def _normalize_cfg(
     ทำ cfg ให้สะอาด + normalize ตัวอักษร
     """
     tags = [t.upper().strip() for t in _parse_list_field(client_tags)]
-    plats = [p.upper().strip() for p in _parse_list_field(platforms)]
+    plats = [p.lower().strip() for p in _parse_list_field(platforms)]  # ✅ use lowercase to match classifier labels
     taxs = [t.strip() for t in _parse_list_field(client_tax_ids)]
 
     # ตัดค่าซ้ำ โดยยังรักษาลำดับ
@@ -177,6 +185,30 @@ def _call_if_supported(obj: Any, method_name: str, /, *args: Any, **kwargs: Any)
     except Exception:
         # fallback: call without kwargs
         return fn(*args)
+
+
+async def _read_uploadfile_safely(f: UploadFile, max_bytes: int) -> bytes:
+    """
+    ✅ อ่านไฟล์แบบปลอดภัย + enforce max bytes ระหว่างอ่าน
+    - แก้ปัญหาอ่านทั้งก้อนแล้วค่อยเช็ค (ทำให้ RAM พังง่าย)
+    """
+    buf = io.BytesIO()
+    total = 0
+    chunk_size = int(os.getenv("UPLOAD_READ_CHUNK_BYTES", "1048576"))  # 1MB default
+
+    while True:
+        chunk = await f.read(chunk_size)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File too large: {f.filename} (max {max_bytes/1024/1024:.1f} MB)",
+            )
+        buf.write(chunk)
+
+    return buf.getvalue()
 
 
 # =========================
@@ -240,6 +272,10 @@ async def upload(
     # ✅ parse + normalize cfg
     cfg = _normalize_cfg(client_tags, client_tax_ids, platforms)
 
+    # ✅ sanity: platforms should match classifier labels
+    allowed_platforms = {"shopee", "lazada", "tiktok", "spx", "ads", "other", "unknown"}
+    cfg["platforms"] = [p for p in cfg.get("platforms", []) if p in allowed_platforms]
+
     # soft limit (กัน RAM พัง) ปรับได้ด้วย ENV
     max_files = int(os.getenv("MAX_UPLOAD_FILES", "500"))
     if len(files) > max_files:
@@ -248,34 +284,40 @@ async def upload(
     # ✅ create job (attach cfg if JobService supports it)
     job_id = _call_if_supported(jobs, "create_job", cfg=cfg)
 
+    # จำกัดขนาดไฟล์ ปรับได้ด้วย ENV
+    max_mb = float(os.getenv("MAX_FILE_MB", "25"))
+    max_bytes = int(max_mb * 1024 * 1024)
+
+    added = 0
     for f in files:
-        content = await f.read()
+        # ✅ IMPORTANT: keep filename (for classifier + extractor reference parsing)
+        filename = (f.filename or "unknown").strip() or "unknown"
+
+        # ✅ read safely with limit
+        content = await _read_uploadfile_safely(f, max_bytes=max_bytes)
         if not content:
             continue
-
-        # จำกัดขนาดไฟล์ ปรับได้ด้วย ENV
-        max_mb = float(os.getenv("MAX_FILE_MB", "25"))
-        if len(content) > int(max_mb * 1024 * 1024):
-            raise HTTPException(
-                status_code=400,
-                detail=f"File too large: {f.filename} (max {max_mb} MB)",
-            )
 
         # ✅ add file (attach cfg if add_file supports it)
         _call_if_supported(
             jobs,
             "add_file",
             job_id=job_id,
-            filename=f.filename or "unknown",
+            filename=filename,
             content_type=f.content_type or "",
             content=content,
             cfg=cfg,  # optional (only if supported)
         )
+        added += 1
+
+    if added == 0:
+        # ✅ fail early: job would be empty -> state error in UI
+        raise HTTPException(status_code=400, detail="All uploaded files were empty")
 
     # ✅ start processing (attach cfg if start_processing supports it)
     _call_if_supported(jobs, "start_processing", job_id, cfg=cfg)
 
-    return {"ok": True, "job_id": job_id, "cfg": cfg}
+    return {"ok": True, "job_id": job_id, "cfg": cfg, "files_added": added}
 
 
 @app.get("/api/job/{job_id}")

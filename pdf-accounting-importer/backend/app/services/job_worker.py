@@ -1,4 +1,3 @@
-# backend/app/services/job_worker.py
 from __future__ import annotations
 
 import io
@@ -21,7 +20,7 @@ from ..utils.validators import (
     validate_vat_rate,
 )
 
-# ✅ NEW: wallet mapping (recommended file you added)
+# ✅ wallet mapping
 try:
     from ..extractors.wallet_mapping import resolve_wallet_code
 except Exception:  # pragma: no cover
@@ -47,19 +46,12 @@ TAXID_TO_COMPANY: Dict[str, str] = {v: k for k, v in CLIENT_TAX_IDS.items()}
 
 RE_TAX13_STRICT = re.compile(r"\b(\d{13})\b")
 
-# seller/shop id hints in OCR text
 RE_SELLER_ID_HINTS = [
     re.compile(r"\b(?:seller_id|seller\s*id|shop_id|shop\s*id|merchant_id|merchant\s*id)\b\D{0,20}(\d{5,20})", re.IGNORECASE),
     re.compile(r"(?:รหัสร้าน|ไอดีร้าน|รหัสผู้ขาย|ร้านค้า)\D{0,20}(\d{5,20})", re.IGNORECASE),
 ]
 RE_ANY_LONG_DIGITS = re.compile(r"\b(\d{6,20})\b")
 
-RE_THAI_DATE_HINT = re.compile(
-    r"(?:วันที่|Date)\s*[:#：]?\s*([0-9]{1,2}[\/\-.][0-9]{1,2}[\/\-.][0-9]{2,4})",
-    re.IGNORECASE,
-)
-
-# Join multi-line invoice/reference tokens: remove ALL whitespace
 RE_ALL_WS = re.compile(r"\s+")
 
 
@@ -79,9 +71,6 @@ def _digits_only(s: str) -> str:
 
 
 def _clean_money_str(v: Any) -> str:
-    """
-    Keep as string for export. Tries to normalize commas/฿/THB.
-    """
     s = _safe_str(v)
     if not s:
         return ""
@@ -89,28 +78,36 @@ def _clean_money_str(v: Any) -> str:
 
 
 def _compact_ref(v: Any) -> str:
-    """
-    Remove ALL whitespace (spaces, tabs, newlines)
-    e.g. "RCSPXSPB00-00000-25 1218-0001593" -> "RCSPXSPB00-00000-251218-0001593"
-    """
     s = _safe_str(v)
     if not s:
         return ""
     return RE_ALL_WS.sub("", s)
 
 
-def _detect_client_tax_id(text: str, filename: str = "") -> str:
+def _detect_client_tax_id(text: str, filename: str = "", cfg: Optional[Dict[str, Any]] = None) -> str:
     """
-    Detect which client company this document belongs to.
+    ✅ FIX: Better priority logic
+    
     Priority:
-      1) Text contains known client tax IDs
-      2) Filename/path hints (RABBIT/SHD/TOPONE)
+      1) Text contains known client tax IDs (most reliable)
+      2) cfg has exactly one client_tax_ids (user selected)
+      3) Filename/path hints (RABBIT/SHD/TOPONE)
+      
+    Note: Text is checked FIRST because it's more reliable than user selection
     """
+    # ✅ Step 1: Check text first (most reliable)
     t = text or ""
     for _, tax in CLIENT_TAX_IDS.items():
         if tax in t:
             return tax
 
+    # ✅ Step 2: Check cfg (user selection)
+    if isinstance(cfg, dict):
+        taxs = cfg.get("client_tax_ids")
+        if isinstance(taxs, list) and len(taxs) == 1 and str(taxs[0]).strip():
+            return str(taxs[0]).strip()
+
+    # ✅ Step 3: Check filename as fallback
     fn = (filename or "").upper()
     for key, tax in CLIENT_TAX_IDS.items():
         if key in fn:
@@ -120,6 +117,10 @@ def _detect_client_tax_id(text: str, filename: str = "") -> str:
 
 
 def _company_from_tax_id(client_tax_id: str, filename: str = "") -> str:
+    """
+    ✅ FIX: Return company name from tax ID or filename
+    Returns empty string if cannot determine (NOT "UNKNOWN")
+    """
     if client_tax_id and client_tax_id in TAXID_TO_COMPANY:
         return TAXID_TO_COMPANY[client_tax_id]
 
@@ -127,42 +128,54 @@ def _company_from_tax_id(client_tax_id: str, filename: str = "") -> str:
     for k in ("RABBIT", "SHD", "TOPONE"):
         if k in fn:
             return k
-    return ""
+    
+    return ""  # ✅ return "" not "UNKNOWN"
 
 
 def _detect_platform_hint_from_filename(filename: str) -> str:
+    """
+    Detect platform from filename
+    Returns empty string if cannot determine (NOT "UNKNOWN")
+    """
     fn = (filename or "").upper()
+    
+    # ✅ Priority order matters: SPX before SHOPEE
+    if "SPX" in fn or "RCSPX" in fn or "SHOPEE EXPRESS" in fn or "SHOPEE-EXPRESS" in fn:
+        return "SPX"
     if "SHOPEE" in fn:
         return "SHOPEE"
-    if "LAZADA" in fn:
+    if "LAZADA" in fn or "LAZ" in fn:
         return "LAZADA"
-    if "TIKTOK" in fn or "TTS" in fn:
+    if "TIKTOK" in fn or "TTS" in fn or "TTSHOP" in fn:
         return "TIKTOK"
-    if "SPX" in fn:
-        return "SPX"
-    if "FACEBOOK" in fn or "META" in fn:
-        return "FACEBOOK"
+    if "FACEBOOK" in fn or "META" in fn or "GOOGLE" in fn or "ADS" in fn:
+        return "ADS"
     if "HASHTAG" in fn:
         return "HASHTAG"
-    return ""
+    
+    return ""  # ✅ return "" not "UNKNOWN"
 
 
 def _platform_upper(platform: str, filename: str = "") -> str:
+    """
+    ✅ FIX: Normalize platform string
+    """
     p = (platform or "").strip().lower()
-    if p in {"shopee", "spx", "lazada", "tiktok"}:
+    
+    # Known platforms
+    if p in {"shopee", "spx", "lazada", "tiktok", "ads", "facebook", "hashtag"}:
         return p.upper()
-    # fallback from filename if classifier says "generic"
+    
+    # Try filename hint
     fh = _detect_platform_hint_from_filename(filename)
-    return fh or (platform or "UNKNOWN").upper()
+    if fh:
+        return fh
+    
+    # ✅ If still unknown, return "UNKNOWN"
+    return (platform or "UNKNOWN").upper()
 
 
 def _detect_seller_id(text: str, filename: str = "") -> str:
-    """
-    Best-effort seller_id/shop_id detection.
-    - Try explicit hints in text
-    - Else try long digit tokens (6..20)
-    - Else try digits in filename
-    """
     t = text or ""
 
     for rx in RE_SELLER_ID_HINTS:
@@ -181,13 +194,10 @@ def _detect_seller_id(text: str, filename: str = "") -> str:
     return ""
 
 
-def _get_job_filters(job_service, job_id: str) -> Tuple[List[str], List[str]]:
+def _get_job_cfg(job_service, job_id: str) -> Dict[str, Any]:
     """
-    Pull selected filters from job (best-effort).
-    Supports multiple possible shapes because your backend/job_service may differ.
-
-    Returns: (allowed_companies_upper, allowed_platforms_upper)
-      - empty list means "allow all"
+    ✅ FIX: ดึง cfg จาก job ได้หลายรูปแบบ (รองรับของเดิม/ของใหม่)
+    main.py ส่ง cfg = {client_tags, client_tax_ids, platforms, strictMode}
     """
     try:
         job = job_service.get_job(job_id)  # type: ignore[attr-defined]
@@ -195,10 +205,52 @@ def _get_job_filters(job_service, job_id: str) -> Tuple[List[str], List[str]]:
         job = None
 
     if not isinstance(job, dict):
-        return ([], [])
+        return {}
 
-    # try common keys (your frontend may send these)
-    # companies
+    cfg = job.get("cfg")
+    if isinstance(cfg, dict):
+        return cfg
+
+    # fallback shapes
+    filters = job.get("filters")
+    if isinstance(filters, dict):
+        # normalize to cfg-ish keys
+        out: Dict[str, Any] = {}
+        if "client_tax_ids" in filters:
+            out["client_tax_ids"] = filters.get("client_tax_ids")
+        if "platforms" in filters:
+            out["platforms"] = filters.get("platforms")
+        if "client_tags" in filters:
+            out["client_tags"] = filters.get("client_tags")
+        if "strictMode" in filters:
+            out["strictMode"] = filters.get("strictMode")
+        if out:
+            return out
+
+    return {}
+
+
+def _get_job_filters(job_service, job_id: str) -> Tuple[List[str], List[str], bool]:
+    """
+    ✅ FIX: Return (allowed_companies, allowed_platforms, strictMode)
+    
+    Returns:
+        - allowed_companies: empty list means "allow all"
+        - allowed_platforms: empty list means "allow all"  
+        - strictMode: if True, reject unknown files; if False, allow unknown files
+    """
+    try:
+        job = job_service.get_job(job_id)  # type: ignore[attr-defined]
+    except Exception:
+        job = None
+
+    if not isinstance(job, dict):
+        return ([], [], False)
+
+    # ✅ Extract strictMode
+    cfg = job.get("cfg") or {}
+    strict_mode = bool(cfg.get("strictMode", False)) if isinstance(cfg, dict) else False
+
     companies = (
         job.get("company_filters")
         or job.get("companies")
@@ -206,10 +258,10 @@ def _get_job_filters(job_service, job_id: str) -> Tuple[List[str], List[str]]:
         or job.get("selected_companies")
         or (job.get("filters") or {}).get("companies")
         or (job.get("filters") or {}).get("company")
+        or (cfg.get("client_tags") if isinstance(cfg, dict) else None)
         or []
     )
 
-    # platforms
     platforms = (
         job.get("platform_filters")
         or job.get("platforms")
@@ -217,6 +269,7 @@ def _get_job_filters(job_service, job_id: str) -> Tuple[List[str], List[str]]:
         or job.get("selected_platforms")
         or (job.get("filters") or {}).get("platforms")
         or (job.get("filters") or {}).get("platform")
+        or (cfg.get("platforms") if isinstance(cfg, dict) else None)
         or []
     )
 
@@ -224,36 +277,78 @@ def _get_job_filters(job_service, job_id: str) -> Tuple[List[str], List[str]]:
         if x is None:
             return []
         if isinstance(x, str):
-            # allow "A,B,C"
             parts = [p.strip() for p in x.split(",") if p.strip()]
             return [p.upper() for p in parts]
         if isinstance(x, (list, tuple, set)):
             return [str(i).strip().upper() for i in x if str(i).strip()]
         return []
 
-    return (_norm_list(companies), _norm_list(platforms))
+    return (_norm_list(companies), _norm_list(platforms), strict_mode)
 
 
 def _cfg_mismatch(
     allowed_companies: List[str],
     allowed_platforms: List[str],
+    strict_mode: bool,
     *,
     company: str,
     platform_u: str,
-) -> bool:
+) -> Tuple[bool, str]:
     """
-    Backend enforcement:
-    - If user selected companies/platforms, and file does not match -> mismatch True
-    - If selection empty -> allow all
+    ✅ FIX: Improved filter matching logic with strictMode
+    
+    Args:
+        allowed_companies: List of allowed companies (empty = allow all)
+        allowed_platforms: List of allowed platforms (empty = allow all)
+        strict_mode: If True, reject unknown; if False, allow unknown
+        company: Detected company (may be empty)
+        platform_u: Detected platform (may be "UNKNOWN")
+    
+    Returns:
+        (is_mismatch, reason)
+    
+    Rules:
+        1. If no filters → allow all (False, "")
+        2. If company/platform is known → must match filter
+        3. If company/platform is unknown:
+           - strictMode=False → allow (False, "")
+           - strictMode=True → reject (True, "unknown in strict mode")
     """
     c = (company or "").upper().strip()
     p = (platform_u or "").upper().strip()
 
-    if allowed_companies and (c not in allowed_companies):
-        return True
-    if allowed_platforms and (p not in allowed_platforms):
-        return True
-    return False
+    # ✅ No filters → allow all
+    has_company_filter = bool(allowed_companies)
+    has_platform_filter = bool(allowed_platforms)
+
+    if not has_company_filter and not has_platform_filter:
+        return (False, "")
+
+    # ============================================================
+    # ✅ COMPANY FILTER
+    # ============================================================
+    if has_company_filter:
+        if c:  # known company
+            if c not in allowed_companies:
+                return (True, f"company={c} not in allowed companies ({','.join(allowed_companies)})")
+        else:  # unknown company
+            if strict_mode:
+                return (True, f"company=unknown (strict mode, allowed: {','.join(allowed_companies)})")
+            # else: allow unknown in non-strict mode
+
+    # ============================================================
+    # ✅ PLATFORM FILTER
+    # ============================================================
+    if has_platform_filter:
+        if p and p != "UNKNOWN":  # known platform
+            if p not in allowed_platforms:
+                return (True, f"platform={p} not in allowed platforms ({','.join(allowed_platforms)})")
+        else:  # unknown platform
+            if strict_mode:
+                return (True, f"platform=unknown (strict mode, allowed: {','.join(allowed_platforms)})")
+            # else: allow unknown in non-strict mode
+
+    return (False, "")
 
 
 def _revalidate(row: Dict[str, Any]) -> List[str]:
@@ -284,58 +379,39 @@ def _revalidate(row: Dict[str, Any]) -> List[str]:
 
 
 def _normalize_row_fields(row: Dict[str, Any], seq: int) -> None:
-    """
-    Normalize core PEAK fields after extractor + AI merge.
-    Keeps everything as strings.
-    Implements:
-      - A_seq sequential
-      - P_wht blank always
-      - C_reference/G_invoice_no compact (remove whitespace/newlines)
-    """
-    # ✅ A_seq must be sequential 1,2,3,...
     row["A_seq"] = seq
 
-    # Dates: must be YYYYMMDD or empty
     for k in ("B_doc_date", "H_invoice_date", "I_tax_purchase_date"):
         if row.get(k):
             row[k] = _digits_only(_safe_str(row.get(k)))[:8]
         else:
             row[k] = _safe_str(row.get(k))
 
-    # Tax / branch
     row["E_tax_id_13"] = _digits_only(_safe_str(row.get("E_tax_id_13")))[:13]
     br = _digits_only(_safe_str(row.get("F_branch_5")))
     row["F_branch_5"] = br.zfill(5)[:5] if br else "00000"
 
-    # price_type
     j = _safe_str(row.get("J_price_type"))
     row["J_price_type"] = j if j in {"1", "2", "3"} else (j or "1")
 
-    # vat_rate
     o = _safe_str(row.get("O_vat_rate")).upper()
     row["O_vat_rate"] = "NO" if o in {"NO", "0", "NONE"} else ("7%" if (o == "" or "7" in o) else o)
 
-    # qty
     row["M_qty"] = _safe_str(row.get("M_qty") or "1") or "1"
 
-    # money-ish
     row["N_unit_price"] = _clean_money_str(row.get("N_unit_price") or row.get("R_paid_amount") or "0") or "0"
     row["R_paid_amount"] = _clean_money_str(row.get("R_paid_amount") or row.get("N_unit_price") or "0") or "0"
 
-    # ✅ WHT must be blank always (your requirement)
     row["P_wht"] = ""
 
-    # ✅ Compact reference/invoice (no whitespace)
     row["C_reference"] = _compact_ref(row.get("C_reference"))
     row["G_invoice_no"] = _compact_ref(row.get("G_invoice_no"))
 
-    # Optional sync: if one empty, copy from the other (after compact)
     if not _safe_str(row.get("C_reference")) and _safe_str(row.get("G_invoice_no")):
         row["C_reference"] = _safe_str(row.get("G_invoice_no"))
     if not _safe_str(row.get("G_invoice_no")) and _safe_str(row.get("C_reference")):
         row["G_invoice_no"] = _safe_str(row.get("C_reference"))
 
-    # strings
     for k in (
         "A_company_name",
         "D_vendor_code",
@@ -350,9 +426,6 @@ def _normalize_row_fields(row: Dict[str, Any], seq: int) -> None:
 
 
 def _extract_embedded_pdf_text(data: bytes, max_pages: int = 15) -> str:
-    """
-    PDF -> embedded text via pdfplumber (fast). If scanned, will usually return empty.
-    """
     try:
         with pdfplumber.open(io.BytesIO(data)) as pdf:
             pages: List[str] = []
@@ -364,10 +437,6 @@ def _extract_embedded_pdf_text(data: bytes, max_pages: int = 15) -> str:
 
 
 def _write_temp_file(filename: str, data: bytes) -> str:
-    """
-    Save uploaded bytes to a temp file (keeps extension if possible),
-    so OCR pipeline that expects a file path can work.
-    """
     ext = os.path.splitext(filename or "")[1].lower()
     if ext not in {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}:
         if data[:5] == b"%PDF-":
@@ -391,12 +460,17 @@ def _should_call_ai(errors: List[str], row: Dict[str, Any]) -> bool:
     return bool(errors) or critical_missing
 
 
-def _append_and_update_file(job_service, job_id: str, idx: int, *, rows: List[Dict[str, Any]], state: str, platform: str, company: str, message: str) -> None:
-    """
-    Compatible with your older job_service API:
-      - append_rows(job_id, rows)
-      - update_file(job_id, idx, {...})
-    """
+def _append_and_update_file(
+    job_service,
+    job_id: str,
+    idx: int,
+    *,
+    rows: List[Dict[str, Any]],
+    state: str,
+    platform: str,
+    company: str,
+    message: str,
+) -> None:
     job_service.append_rows(job_id, rows)
 
     job_service.update_file(
@@ -418,27 +492,17 @@ def _append_and_update_file(job_service, job_id: str, idx: int, *, rows: List[Di
 
 def process_job_files(job_service, job_id: str) -> None:
     """
-    ✅ Implements your requirements (backend side):
-
-    1) Backend filter enforcement:
-       - อ่าน filter ที่ frontend ส่งมาไว้ใน job (best-effort)
-       - ถ้า company/platform ไม่อยู่ในตัวเลือก -> file_state = needs_review
-         และ row._status = NEEDS_REVIEW (+ error reason)
-
-    2) A_seq sequential 1..N (ไม่ใช่ 1,1,1)
-
-    3) P_wht blank ALWAYS
-
-    4) C_reference + G_invoice_no: remove whitespace/newlines so tokens glued
-
-    5) Q_payment_method wallet:
-       - ใช้ wallet_mapping.resolve_wallet_code(client_tax_id, seller_id, shop_name, text)
-       - ถ้า resolve ไม่ได้ -> เพิ่ม error "ไม่พบ wallet code" (ให้ไป review)
-       - กัน AI มาเขียนทับ wallet + กัน AI มาใส่ P_wht
+    ✅ FIX summary:
+    - Improved filter logic with strictMode support
+    - Better company/platform detection (text > cfg > filename)
+    - Clear error messages with reasons
+    - Always append rows (prevents rows=0)
     """
     payloads: List[Tuple[str, str, bytes]] = job_service.get_payloads(job_id)
 
-    allowed_companies, allowed_platforms = _get_job_filters(job_service, job_id)
+    # ✅ Get filters + strictMode
+    allowed_companies, allowed_platforms, strict_mode = _get_job_filters(job_service, job_id)
+    cfg = _get_job_cfg(job_service, job_id)
 
     seq = 1
     ok_files = 0
@@ -452,7 +516,6 @@ def process_job_files(job_service, job_id: str) -> None:
         filename = filename or "unknown"
         content_type = content_type or ""
 
-        # Start processing state
         job_service.update_file(job_id, idx, {"state": "processing"})
 
         platform_u = "UNKNOWN"
@@ -466,21 +529,32 @@ def process_job_files(job_service, job_id: str) -> None:
             text = ""
             is_pdf = filename.lower().endswith(".pdf") or (content_type == "application/pdf")
 
-            # 1) embedded PDF text first
             if is_pdf:
                 text = _extract_embedded_pdf_text(data, max_pages=15)
 
-            # 2) OCR/text extraction fallback (expects file_path)
             if not text:
                 tmp_path = _write_temp_file(filename, data)
                 text = maybe_ocr_to_text(tmp_path)
 
             text = normalize_text(text)
 
-            if not text:
-                platform_u = _detect_platform_hint_from_filename(filename) or "UNKNOWN"
-                company = _company_from_tax_id("", filename)
+            # ✅ Determine client/company early (priority: text > cfg > filename)
+            client_tax_id = _detect_client_tax_id(text, filename, cfg=cfg)
+            company = _company_from_tax_id(client_tax_id, filename)
 
+            if not text:
+                # ✅ No text → minimal row
+                platform_u = _detect_platform_hint_from_filename(filename) or "UNKNOWN"
+                
+                # ✅ Check filter mismatch even for no-text case
+                is_mismatch, mismatch_reason = _cfg_mismatch(
+                    allowed_companies,
+                    allowed_platforms,
+                    strict_mode,
+                    company=company,
+                    platform_u=platform_u,
+                )
+                
                 row_min = {
                     "A_seq": seq,
                     "A_company_name": company,
@@ -489,12 +563,18 @@ def process_job_files(job_service, job_id: str) -> None:
                     "_status": "NEEDS_REVIEW",
                     "_errors": ["ไม่พบข้อความจากเอกสาร"],
                 }
+                
+                if is_mismatch:
+                    row_min["_errors"].append(f"ไม่ตรง filter: {mismatch_reason}")
+                
                 _normalize_row_fields(row_min, seq=seq)
                 rows_out.append(row_min)
                 seq += 1
 
                 file_state = "needs_review"
-                message = "ยังไม่มีข้อความจากเอกสาร (PDF สแกน/รูปภาพ) — ต้องเปิด OCR หรือรีวิวเอง"
+                message = "ไม่พบข้อความ"
+                if is_mismatch:
+                    message += f" + {mismatch_reason}"
                 review_files += 1
 
                 _append_and_update_file(
@@ -507,33 +587,29 @@ def process_job_files(job_service, job_id: str) -> None:
                     company=company,
                     message=message,
                 )
-
             else:
-                # 3) Extract with rule-based extractor (pass filename so extractor can use it)
-                platform, base_row, errors = extract_row_from_text(text, filename=filename, client_tax_id="")
+                # ✅ Has text → full extraction
+                platform, base_row, errors = extract_row_from_text(
+                    text,
+                    filename=filename,
+                    client_tax_id=client_tax_id,
+                    cfg=cfg,
+                )
 
-                # detect client/company
-                client_tax_id = _detect_client_tax_id(text, filename)
-                company = _company_from_tax_id(client_tax_id, filename)
-
-                # normalize platform label (upper)
                 platform_u = _platform_upper(platform, filename)
 
-                # backend filter mismatch?
-                mismatch = _cfg_mismatch(
+                # ✅ Check filter mismatch with improved logic
+                is_mismatch, mismatch_reason = _cfg_mismatch(
                     allowed_companies,
                     allowed_platforms,
+                    strict_mode,
                     company=company,
                     platform_u=platform_u,
                 )
 
-                # detect seller_id for wallet mapping
                 seller_id = _detect_seller_id(text, filename)
-
-                # shop_name hint: filename stem without extension (best-effort)
                 shop_name_hint = os.path.splitext(os.path.basename(filename))[0]
 
-                # resolve wallet code (only if mapping module available)
                 wallet_code = ""
                 if resolve_wallet_code is not None:
                     try:
@@ -546,10 +622,9 @@ def process_job_files(job_service, job_id: str) -> None:
                     except Exception:
                         wallet_code = ""
 
-                # Build row + merge base extractor row
                 row: Dict[str, Any] = {
                     "A_seq": seq,
-                    "A_company_name": company,  # ✅ show in table/export
+                    "A_company_name": company,
                     "_source_file": filename,
                     "_platform": platform_u,
                     "_client_tax_id": client_tax_id,
@@ -559,22 +634,15 @@ def process_job_files(job_service, job_id: str) -> None:
                 if isinstance(base_row, dict):
                     row.update(base_row)
 
-                # apply wallet (do not let extractor/AI override later)
                 if wallet_code:
                     row["Q_payment_method"] = wallet_code
                 else:
-                    # wallet is required in your rule-set (at least for Shopee; you can widen later)
-                    # we'll enforce for Shopee documents
                     if platform_u == "SHOPEE":
                         row["_errors"] = list(row.get("_errors") or []) + ["ไม่พบ wallet code (Q_payment_method)"]
 
-                # Normalize BEFORE AI
                 _normalize_row_fields(row, seq=seq)
 
-                # 4) Optional AI completion step
-                # IMPORTANT:
-                # - exclude P_wht from AI (always blank)
-                # - after AI, re-apply wallet_code and set P_wht blank again
+                # ✅ Call AI if needed
                 if _should_call_ai(list(row.get("_errors") or []), row):
                     partial_keys = [
                         "B_doc_date",
@@ -591,7 +659,6 @@ def process_job_files(job_service, job_id: str) -> None:
                         "M_qty",
                         "N_unit_price",
                         "O_vat_rate",
-                        # "P_wht",  # ❌ DO NOT ask AI (must be blank)
                         "Q_payment_method",
                         "R_paid_amount",
                         "S_pnd",
@@ -610,12 +677,9 @@ def process_job_files(job_service, job_id: str) -> None:
                         for k, v in ai_patch.items():
                             if not k:
                                 continue
-                            # keep internal meta keys
                             if k.startswith("_"):
                                 row[k] = v
                                 continue
-
-                            # Hard bans (your rules)
                             if k == "P_wht":
                                 continue
 
@@ -627,43 +691,33 @@ def process_job_files(job_service, job_id: str) -> None:
                                 if _safe_str(row.get(k)) in {"", "0", "0.0", "0.00"}:
                                     row[k] = v_str
                             else:
-                                # if base extractor had errors -> allow override
                                 if row.get("_errors"):
                                     row[k] = v_str
                                 else:
                                     if _safe_str(row.get(k)) in {"", "0", "0.0", "0.00"}:
                                         row[k] = v_str
 
-                # Re-apply wallet AFTER AI (AI must not overwrite)
                 if wallet_code:
                     row["Q_payment_method"] = wallet_code
-                else:
-                    if platform_u == "SHOPEE":
-                        # keep the error (already appended above) — no action
-                        pass
 
-                # Force rules again AFTER AI
-                row["P_wht"] = ""  # ✅ always blank
-
-                # Normalize AFTER AI
+                row["P_wht"] = ""
                 _normalize_row_fields(row, seq=seq)
 
-                # Re-validate
+                # ✅ Revalidate
                 errors2 = _revalidate(row)
-                # Keep wallet error if present
                 prev_errs = list(row.get("_errors") or [])
-                # Merge unique
                 merged = []
                 for e in prev_errs + errors2:
                     if e and e not in merged:
                         merged.append(e)
                 row["_errors"] = merged
 
-                # 5) Decide status
-                if mismatch:
+                # ✅ Determine final status with clear messaging
+                if is_mismatch:
                     row["_status"] = "NEEDS_REVIEW"
+                    row["_errors"].append(f"ไม่ตรง filter: {mismatch_reason}")
                     file_state = "needs_review"
-                    message = "ไม่ตรงตัวกรองที่เลือก (backend) — ส่งไป review"
+                    message = mismatch_reason
                     review_files += 1
                 else:
                     if row["_errors"]:
@@ -694,6 +748,7 @@ def process_job_files(job_service, job_id: str) -> None:
         except Exception as e:
             error_files += 1
 
+            # ✅ IMPORTANT: always append an ERROR row (prevents rows=0)
             err_row = {
                 "A_seq": seq,
                 "A_company_name": company or "",
@@ -718,7 +773,7 @@ def process_job_files(job_service, job_id: str) -> None:
                     "platform": platform_u or "UNKNOWN",
                     "company": company or "",
                     "message": f"Error: {type(e).__name__}: {e}",
-                    "rows_count": 0,
+                    "rows_count": 1,
                 },
             )
 

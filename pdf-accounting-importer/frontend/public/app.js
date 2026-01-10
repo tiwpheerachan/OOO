@@ -40,6 +40,9 @@
 
     // ✅ remember which filters used for each job (local)
     jobConfig: null,
+    
+    // ✅ NEW: filter strictness mode
+    strictMode: false,  // false = allow unknown files, true = reject unknown files
   };
 
   const LS_HISTORY_KEY = "peak_job_history_v1";
@@ -52,7 +55,7 @@
   // =========================================================
   const COLUMNS = [
     ["A_seq","ลำดับที่*"],
-    ["A_company_name","ชื่อบริษัท"], // ✅ NEW
+    ["A_company_name","ชื่อบริษัท"],
     ["B_doc_date","วันที่เอกสาร"],
     ["C_reference","อ้างอิงถึง"],
     ["D_vendor_code","ผู้รับเงิน/คู่ค้า"],
@@ -114,16 +117,30 @@
   }
 
   // =========================================================
-  // ✅ Infer (จากชื่อไฟล์) เพื่อ pre-filter
+  // ✅ Infer (จากชื่อไฟล์) - แก้ไขให้แม่นกว่าเดิม
   // =========================================================
   function normalizeName(s){
-    return String(s || "").toLowerCase().replace(/\s+/g, " ").trim();
+    // แปลง underscore, dash, dot เป็น space ก่อน lowercase
+    return String(s || "")
+      .toLowerCase()
+      .replace(/[_\-\.]/g, " ")  // ✅ แปลง _ - . เป็น space
+      .replace(/\s+/g, " ")      // collapse spaces
+      .trim();
   }
+
   function includesAnyToken(name, tokens){
     const s = normalizeName(name);
     for(const t of tokens || []){
       if(!t) continue;
-      const rx = new RegExp(String(t).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      
+      // ✅ แปลง token ให้ตรงกับ normalizeName
+      const tNorm = normalizeName(t);
+      
+      // ใช้ word boundary เพื่อป้องกัน partial match
+      // เช่น "shopee" ไม่ควรตรงกับ "shopeexpress"
+      const escaped = tNorm.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const rx = new RegExp(`\\b${escaped}\\b`, "i");
+      
       if(rx.test(s)) return true;
     }
     return false;
@@ -131,25 +148,29 @@
 
   function inferClientTagFromFilename(filename){
     const s = normalizeName(filename);
-    for(const tag of Object.keys(CLIENTS)){
-      const tokens = CLIENTS[tag].tokens || [];
-      if(tokens.length && includesAnyToken(s, tokens)) return tag;
+    
+    // ✅ Check ตาม priority (specific → general)
+    for(const [tag, config] of Object.entries(CLIENTS)){
+      const tokens = config.tokens || [];
+      if(tokens.length && includesAnyToken(s, tokens)){
+        return tag;
+      }
     }
-    if(/\bshd\b/.test(s)) return "SHD";
-    if(/\brabbit\b/.test(s) || /\brb\b/.test(s)) return "RABBIT";
-    if(/\btopone\b/.test(s) || /\btop one\b/.test(s)) return "TOPONE";
-    if(/\bhashtag\b/.test(s) || /#/.test(s)) return "HASHTAG";
-    return null;
+    
+    return null;  // ✅ ไม่พบ → return null (ไม่ใช่ default)
   }
 
   function inferPlatformFromFilename(filename){
     const s = normalizeName(filename);
-    if(/\bspx\b/.test(s) || /shopee\s*express/.test(s)) return "SPX";
+    
+    // ✅ Check ตาม priority (SPX ก่อน SHOPEE เพราะ shopee express ต้องเป็น SPX)
+    if(/\b(spx|shopee express|shopee\s*express)\b/.test(s)) return "SPX";
     if(/\bshopee\b/.test(s)) return "SHOPEE";
-    if(/\blazada\b/.test(s) || /\blaz\b/.test(s)) return "LAZADA";
-    if(/\btiktok\b/.test(s) || /\btts\b/.test(s) || /ttshop/.test(s)) return "TIKTOK";
-    if(/\bfacebook\b/.test(s) || /\bfb\b/.test(s) || /\bmeta\b/.test(s)) return "FACEBOOK";
-    return "OTHER";
+    if(/\b(lazada|laz)\b/.test(s)) return "LAZADA";
+    if(/\b(tiktok|tts|ttshop|tik\s*tok)\b/.test(s)) return "TIKTOK";
+    if(/\b(facebook|fb|meta)\b/.test(s)) return "FACEBOOK";
+    
+    return null;  // ✅ ไม่พบ → return null (ไม่ใช่ "OTHER")
   }
 
   // =========================================================
@@ -202,7 +223,7 @@
   }
 
   // =========================================================
-  // ✅ Snow (ของเดิม + เพิ่ม chipRow css นิดหน่อย)
+  // ✅ Snow (ของเดิม)
   // =========================================================
   function ensureSnowCSS(){
     if(document.getElementById("snowStyle_v1")) return;
@@ -236,9 +257,20 @@
   100% { transform: translate3d(var(--drift, 0px), calc(100% + 90px), 0); opacity: 0.05; }
 }
 
-/* ===== Settings chip row (เพิ่มให้แน่ใจว่าจัดระเบียบ) ===== */
+/* ===== Settings chip row ===== */
 .chipRow{ display:flex; gap:8px; flex-wrap:wrap; }
 .chip.ghost{ opacity:.82; }
+
+/* ===== Filter details ===== */
+.filterDetails{
+  font-size: 0.85rem;
+  color: #666;
+  margin-top: 0.5rem;
+  padding: 0.5rem;
+  background: #f5f5f5;
+  border-radius: 4px;
+}
+.filterDetails strong{ color: #333; }
     `.trim();
 
     const style = document.createElement("style");
@@ -803,7 +835,7 @@
   }
 
   // =========================================================
-  // ✅ Pre-upload filter controls
+  // ✅ Pre-upload filter controls - แก้ไขให้ชัดเจนและแม่นยำ
   // =========================================================
   function toggleChip(btn, isOn){
     if(!btn) return;
@@ -840,44 +872,129 @@
     info.textContent = extraNote ? `${base} · ${extraNote}` : base;
   }
 
+  /**
+   * ✅ แก้ไข: Pre-filter logic ที่ชัดเจนและแม่นยำ
+   * 
+   * กฎการกรอง:
+   * 1. ถ้าไม่มี filter ใดๆ → ให้ทุกไฟล์ผ่าน
+   * 2. ถ้ามี client filter:
+   *    - infer ได้ + อยู่ใน filter → KEEP
+   *    - infer ได้ + ไม่อยู่ใน filter → SKIP
+   *    - infer ไม่ได้ → ขึ้นอยู่กับ strictMode:
+   *      * strictMode = false (default) → KEEP (ให้โอกาส)
+   *      * strictMode = true → SKIP (เข้มงวด)
+   * 3. ถ้ามี platform filter: (logic เดียวกัน)
+   * 4. ถ้ามีทั้ง client และ platform filter → ต้องผ่านทั้ง 2 เงื่อนไข
+   */
   function prefilterFilesBeforeUpload(files){
     const doClient = state.clientFilters.size > 0;
     const doPlat = state.platformFilters.size > 0;
 
+    // ✅ ถ้าไม่มี filter → ให้ทุกไฟล์ผ่าน
     if(!doClient && !doPlat){
-      return { kept: files, skipped: [], note: "" };
+      return { kept: files, skipped: [], details: [] };
     }
 
     const kept = [];
     const skipped = [];
+    const details = [];  // ✅ เก็บรายละเอียดเพื่อแสดง UI
 
     for(const f of files){
       const fname = f?.name || "";
-      const c = inferClientTagFromFilename(fname); // null if unknown
-      const p = inferPlatformFromFilename(fname);  // OTHER if unknown
+      const clientTag = inferClientTagFromFilename(fname);  // null if unknown
+      const platformTag = inferPlatformFromFilename(fname); // null if unknown
 
-      let ok = true;
+      let passClient = true;
+      let passPlatform = true;
+      let reason = "";
 
-      // client:
-      // - infer ได้ + ไม่อยู่ใน filter => skip
-      // - infer ไม่ได้ => allow (กันตัดผิด)
-      if(doClient && c){
-        if(!state.clientFilters.has(String(c).toUpperCase())) ok = false;
+      // ============================================================
+      // ✅ CLIENT FILTER
+      // ============================================================
+      if(doClient){
+        if(clientTag){
+          // ✅ เดาได้ → ตรวจสอบว่าอยู่ใน filter หรือไม่
+          if(state.clientFilters.has(clientTag)){
+            passClient = true;
+          }else{
+            passClient = false;
+            reason = `client=${clientTag} (ไม่อยู่ใน filter)`;
+          }
+        }else{
+          // ✅ เดาไม่ได้ → ขึ้นอยู่กับ strictMode
+          if(state.strictMode){
+            passClient = false;
+            reason = "client=unknown (strict mode)";
+          }else{
+            passClient = true;  // ✅ ให้โอกาส (default)
+          }
+        }
       }
 
-      // platform:
-      // - ถ้า infer ได้เป็นแพลตฟอร์มหลัก (ไม่ใช่ OTHER) และไม่อยู่ใน filter => skip
-      // - ถ้า OTHER/เดาไม่ได้ => allow (กันตัดผิด)
-      if(doPlat && p && p !== "OTHER"){
-        if(!state.platformFilters.has(String(p).toUpperCase())) ok = false;
+      // ============================================================
+      // ✅ PLATFORM FILTER
+      // ============================================================
+      if(doPlat){
+        if(platformTag){
+          // ✅ เดาได้ → ตรวจสอบว่าอยู่ใน filter หรือไม่
+          if(state.platformFilters.has(platformTag)){
+            passPlatform = true;
+          }else{
+            passPlatform = false;
+            const prevReason = reason;
+            reason = prevReason
+              ? `${prevReason}, platform=${platformTag} (ไม่อยู่ใน filter)`
+              : `platform=${platformTag} (ไม่อยู่ใน filter)`;
+          }
+        }else{
+          // ✅ เดาไม่ได้ → ขึ้นอยู่กับ strictMode
+          if(state.strictMode){
+            passPlatform = false;
+            const prevReason = reason;
+            reason = prevReason
+              ? `${prevReason}, platform=unknown (strict mode)`
+              : "platform=unknown (strict mode)";
+          }else{
+            passPlatform = true;  // ✅ ให้โอกาส (default)
+          }
+        }
       }
 
-      if(ok) kept.push(f);
-      else skipped.push(f);
+      // ============================================================
+      // ✅ FINAL DECISION
+      // ============================================================
+      const pass = passClient && passPlatform;
+
+      if(pass){
+        kept.push(f);
+        details.push({
+          filename: fname,
+          status: "✅ KEEP",
+          client: clientTag || "unknown",
+          platform: platformTag || "unknown"
+        });
+      }else{
+        skipped.push(f);
+        details.push({
+          filename: fname,
+          status: "❌ SKIP",
+          client: clientTag || "unknown",
+          platform: platformTag || "unknown",
+          reason: reason || "ไม่ตรง filter"
+        });
+      }
     }
 
-    const note = skipped.length ? `ข้าม ${skipped.length} ไฟล์ (ไม่ตรง filter)` : "";
-    return { kept, skipped, note };
+    // ✅ สร้าง summary note
+    let note = "";
+    if(skipped.length > 0){
+      note = `ข้าม ${skipped.length} ไฟล์ (ไม่ตรง filter)`;
+    }
+    if(kept.length === 0 && files.length > 0){
+      note = "⚠️ ทุกไฟล์ถูกข้าม - ลองปรับ filter";
+    }
+
+    return { kept, skipped, details, note };
   }
 
   function currentJobCfgFromFilters(){
@@ -889,6 +1006,38 @@
       .filter(Boolean);
 
     return { clientTags, clientTaxIds, platforms, savedAt: nowISO() };
+  }
+
+  /**
+   * ✅ แสดงรายละเอียดการกรอง (optional - ถ้าต้องการ)
+   */
+  function showFilterDetails(details){
+    const container = el("filterDetails");
+    if(!container) return;
+
+    if(!details || details.length === 0){
+      container.style.display = "none";
+      return;
+    }
+
+    const kept = details.filter(d => d.status === "✅ KEEP");
+    const skipped = details.filter(d => d.status === "❌ SKIP");
+
+    let html = `<div class="filterDetails">`;
+    html += `<strong>รายละเอียดการกรอง:</strong><br>`;
+    html += `✅ เก็บ: ${kept.length} ไฟล์<br>`;
+    html += `❌ ข้าม: ${skipped.length} ไฟล์<br>`;
+    
+    if(skipped.length > 0 && skipped.length <= 10){
+      html += `<br><strong>ไฟล์ที่ข้าม:</strong><br>`;
+      skipped.forEach(d => {
+        html += `• ${escapeHtml(d.filename)} (${escapeHtml(d.reason || "")})<br>`;
+      });
+    }
+    
+    html += `</div>`;
+    container.innerHTML = html;
+    container.style.display = "block";
   }
 
   // ---- bind ----
@@ -1008,11 +1157,23 @@
       state.rows = [];
       renderTable();
 
-      // ✅ pre-filter ก่อนส่งขึ้น backend
-      const { kept, skipped, note } = prefilterFilesBeforeUpload(state.files);
+      // ✅ pre-filter ก่อนส่งขึ้น backend (ปรับปรุงแล้ว)
+      const { kept, skipped, details, note } = prefilterFilesBeforeUpload(state.files);
+
+      // ✅ แสดงรายละเอียดการกรอง (optional)
+      if(typeof showFilterDetails === "function"){
+        showFilterDetails(details);
+      }
 
       if(!kept.length){
-        alert("ไม่มีไฟล์ที่ตรงกับ Filter ที่เลือก (ทุกไฟล์ถูกข้ามหมด)\nลองกด Clear หรือเลือกบริษัท/แพลตฟอร์มใหม่");
+        alert(
+          "⚠️ ไม่มีไฟล์ที่ตรงกับ Filter ที่เลือก (ทุกไฟล์ถูกข้ามหมด)\n\n" +
+          "แนะนำ:\n" +
+          "• กด 'Clear' ที่ Client/Platform filter\n" +
+          "• เลือก filter ใหม่\n" +
+          "• ตรวจสอบชื่อไฟล์ว่ามี keyword หรือไม่\n\n" +
+          `ไฟล์ที่ข้าม: ${skipped.length} ไฟล์`
+        );
         el("btnUpload").disabled = false;
         return;
       }
@@ -1071,6 +1232,10 @@
       el("queue").innerHTML = `<div class="muted small">ยังไม่มีงาน</div>`;
       setProgressUI(null);
       renderTable();
+      
+      // ✅ ซ่อนรายละเอียด filter
+      const detailsEl = el("filterDetails");
+      if(detailsEl) detailsEl.style.display = "none";
     });
 
     // filter chips (ผลลัพธ์)

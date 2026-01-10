@@ -1,67 +1,142 @@
+# backend/app/utils/text_utils.py
+"""
+Text utilities for extractors
+"""
 from __future__ import annotations
+
 import re
-from datetime import datetime
+import unicodedata
+from typing import Optional
 
-RE_THAI_DIGITS = str.maketrans("๐๑๒๓๔๕๖๗๘๙", "0123456789")
+# Thai digit mapping
+THAI_DIGITS = "๐๑๒๓๔๕๖๗๘๙"
+ARABIC_DIGITS = "0123456789"
+THAI_TO_ARABIC = str.maketrans(THAI_DIGITS, ARABIC_DIGITS)
 
-def normalize_text(s: str) -> str:
-    if not s:
-        return ""
-    s = s.translate(RE_THAI_DIGITS)
-    s = s.replace("\u00a0"," ")
-    s = re.sub(r"[ \t]+", " ", s)
-    return s.strip()
 
-def only_digits(s: str) -> str:
-    return re.sub(r"\D+", "", s or "")
-
-def fmt_branch_5(s: str) -> str:
-    d = only_digits(s)
-    if not d:
-        return ""
-    try:
-        n = int(d)
-        return f"{n:05d}"
-    except:
-        return ""
-
-def fmt_tax_13(s: str) -> str:
-    d = only_digits(s)
-    if len(d) == 13:
-        return d
-    return ""
-
-def parse_date_to_yyyymmdd(text: str) -> str:
-    # supports: YYYY-MM-DD, DD/MM/YYYY, DD-MM-YYYY, YYYY/MM/DD
-    t = normalize_text(text)
-    if not t:
-        return ""
-
-    # YYYYMMDD already?
-    if re.fullmatch(r"\d{8}", t):
-        return t
-
-    m = re.search(r"(\d{4})[\-/\.](\d{1,2})[\-/\.](\d{1,2})", t)
-    if m:
-        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        if 1900 <= y <= 2200 and 1 <= mo <= 12 and 1 <= d <= 31:
-            return f"{y:04d}{mo:02d}{d:02d}"
-
-    m = re.search(r"(\d{1,2})[\-/\.](\d{1,2})[\-/\.](\d{2,4})", t)
-    if m:
-        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        if y < 100:
-            y += 2000
-        if 1900 <= y <= 2200 and 1 <= mo <= 12 and 1 <= d <= 31:
-            return f"{y:04d}{mo:02d}{d:02d}"
-
-    return ""
-
-def parse_money(text: str) -> str:
-    # returns normalized numeric string without commas
+def normalize_text(text: Optional[str]) -> str:
+    """
+    Normalize text for extraction:
+    - Convert Thai digits to Arabic
+    - Normalize Unicode
+    - Fix common OCR errors
+    - Preserve structure (newlines)
+    
+    Args:
+        text: Raw text from PDF
+    
+    Returns:
+        Normalized text
+    """
     if not text:
         return ""
-    t = normalize_text(text)
-    t = t.replace(",", "")
-    m = re.search(r"(-?\d+(?:\.\d{1,4})?)", t)
-    return m.group(1) if m else ""
+    
+    # Convert to string
+    text = str(text)
+    
+    # Thai digits → Arabic
+    text = text.translate(THAI_TO_ARABIC)
+    
+    # Normalize Unicode (NFC form)
+    text = unicodedata.normalize('NFC', text)
+    
+    # Fix common OCR errors
+    text = text.replace('ๆ', '')  # Thai repeat character
+    text = text.replace('\x00', '')  # Null bytes
+    
+    # Normalize whitespace (but keep newlines)
+    lines = text.split('\n')
+    normalized_lines = []
+    for line in lines:
+        # Collapse multiple spaces
+        line = re.sub(r'[ \t]+', ' ', line)
+        # Trim line
+        line = line.strip()
+        if line:  # Skip empty lines
+            normalized_lines.append(line)
+    
+    return '\n'.join(normalized_lines)
+
+
+def clean_number_string(s: str) -> str:
+    """
+    Clean number string: remove commas, spaces, currency symbols
+    
+    Args:
+        s: Number string like "1,234.56" or "฿1234"
+    
+    Returns:
+        Clean number string like "1234.56"
+    """
+    if not s:
+        return ""
+    
+    s = str(s).strip()
+    
+    # Remove common symbols
+    s = s.replace(',', '')
+    s = s.replace(' ', '')
+    s = s.replace('฿', '')
+    s = s.replace('THB', '')
+    s = s.replace('Baht', '')
+    
+    # Keep only digits and decimal point
+    s = re.sub(r'[^\d.]', '', s)
+    
+    return s
+
+
+def extract_thai_text(text: str) -> str:
+    """
+    Extract only Thai characters from text
+    
+    Args:
+        text: Mixed text
+    
+    Returns:
+        Thai text only
+    """
+    if not text:
+        return ""
+    
+    # Thai Unicode range: \u0E00-\u0E7F
+    thai_chars = re.findall(r'[\u0E00-\u0E7F\s]+', text)
+    
+    return ' '.join(thai_chars).strip()
+
+
+def is_thai_text(text: str, threshold: float = 0.3) -> bool:
+    """
+    Check if text contains significant Thai content
+    
+    Args:
+        text: Text to check
+        threshold: Minimum ratio of Thai characters (0.0-1.0)
+    
+    Returns:
+        True if text has enough Thai characters
+    """
+    if not text:
+        return False
+    
+    text = str(text).strip()
+    if len(text) < 3:
+        return False
+    
+    # Count Thai characters
+    thai_count = len(re.findall(r'[\u0E00-\u0E7F]', text))
+    total_chars = len([c for c in text if not c.isspace()])
+    
+    if total_chars == 0:
+        return False
+    
+    ratio = thai_count / total_chars
+    return ratio >= threshold
+
+
+__all__ = [
+    'normalize_text',
+    'clean_number_string',
+    'extract_thai_text',
+    'is_thai_text',
+]
