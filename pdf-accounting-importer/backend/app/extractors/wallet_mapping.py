@@ -35,14 +35,15 @@ CLIENT_TOPONE = "0105565027615"
 
 # Rabbit wallets
 RABBIT_WALLET_BY_SELLER_ID: Dict[str, str] = {
-    "0000000001": "EWL001",  # Shopee-70mai
-    "0000000002": "EWL002",  # Shopee-ddpai
-    "0000000003": "EWL003",  # Shopee-jimmy
-    "0000000004": "EWL004",  # Shopee-mibro
-    "0000000006": "EWL006",  # Shopee-toptoy
-    "0000000007": "EWL007",  # Shopee-uwant
-    "0000000008": "EWL008",  # Shopee-wanbo
-    "0000000009": "EWL009",  # Shopee-zepp
+    "253227155": "EWL001",  # Shopee-70mai
+    "235607098": "EWL002",  # Shopee-ddpai
+    "516516644": "EWL003",  # Shopee-jimmy
+    "1443909809": "EWL004",  # Shopee-mibro
+    "1232116856": "EWL005",  # Shopee-MOVA
+    "1357179095": "EWL006",  # Shopee-toptoy
+    "1416156484": "EWL007",  # Shopee-uwant
+    "418530715": "EWL008",  # Shopee-wanbo
+    "349400909": "EWL009",  # Shopee-zepp
     "142025022504068027": "EWL010",  # Rabbit (Rabbit)
 }
 
