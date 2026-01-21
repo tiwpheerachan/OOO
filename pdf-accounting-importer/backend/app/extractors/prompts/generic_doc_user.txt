@@ -1,0 +1,7 @@
+This is an unfamiliar/unknown document.
+Extract only what is explicitly present in text.
+If key fields are missing, leave them empty (do not hallucinate).
+Return JSON patch for PEAK fields only.
+
+TEXT:
+{{TEXT}}

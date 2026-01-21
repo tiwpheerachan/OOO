@@ -1,131 +1,289 @@
-from __future__ import annotations
+# backend/app/services/export_service.py
+"""
+Export Service - Enhanced Version (SunEtLune / PEAK A–U)
 
-import json
-import os
-import re
-from dataclasses import dataclass
-from datetime import datetime
-from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, List, Optional, Tuple
-
-from openai import OpenAI
-
-# ------------------------------------------------------------
-# PEAK A–U fields
-# ------------------------------------------------------------
-PEAK_FIELDS: List[str] = [
-    "A_seq", "B_doc_date", "C_reference", "D_vendor_code", "E_tax_id_13", "F_branch_5",
-    "G_invoice_no", "H_invoice_date", "I_tax_purchase_date", "J_price_type", "K_account",
-    "L_description", "M_qty", "N_unit_price", "O_vat_rate", "P_wht", "Q_payment_method",
-    "R_paid_amount", "S_pnd", "T_note", "U_group",
-]
-
-# Allowed enums / guidance (AI-side only; pipeline will remap later)
-VENDOR_CODES = ["Shopee", "Lazada", "TikTok", "SPX", "Other"]
-GROUPS = ["Marketplace Expense", "Advertising Expense", "Inventory/COGS", "Other Expense"]
-
-# Known client tax ids (your companies)
-CLIENT_TAX_IDS = {
-    "0105563022918",  # SHD
-    "0105561071873",  # Rabbit
-    "0105565027615",  # TopOne
-}
-
-# ------------------------------------------------------------
-# System prompt (STRICT JSON only)
-# ------------------------------------------------------------
-SYSTEM = """You are an expert Thai accounting document extractor.
-
-Goal:
-Extract accounting fields for PEAK A–U import template from Thai/English documents (invoices, tax invoices, receipts).
-Return STRICT JSON only (no markdown, no explanation).
-
-Hard rules:
-- Return a JSON object with keys EXACTLY matching the provided template_fields.
-- If unknown: return empty string "" (never null).
-- Dates must be YYYYMMDD.
-- Tax ID must be exactly 13 digits, no spaces.
-- Branch must be 5 digits (pad with leading zeros; head office is 00000).
-- Money fields must be plain numbers with 2 decimals if possible (e.g. 1234.50). No commas.
-- Vendor_code must be one of: Shopee, Lazada, TikTok, SPX, Other.
-- J_price_type: 1=แยก VAT, 2=รวม VAT, 3=ไม่มี VAT.
-- O_vat_rate: '7%' or 'NO'
-- U_group: choose from Marketplace Expense, Advertising Expense, Inventory/COGS, Other Expense
-
-Quality rules:
-- Prefer the document number / invoice number that represents the official tax invoice (often with platform prefixes).
-- If there is a "reference code" like MMDD-XXXXXXX near the doc number, keep it (e.g. "TRS... 1203-0012589").
-- Prefer vendor tax id (platform company), NOT the customer's tax id.
-- If multiple totals appear, prefer Grand Total / Amount Due / Total including VAT.
-- T_note must be EMPTY ("") always. Do not put any notes.
+Key Fixes & Improvements:
+1) Correct platform detection (prefer _platform_detected / _route_name) — do NOT confuse with U_group
+2) Correct U_group meaning (expense group), not "META/GOOGLE"
+3) Platform-aware defaults (vendor name / VAT / price_type) + validation notes
+4) Resolve "ผู้รับเงิน/คู่ค้า" (D_vendor_code) into vendor CODE (Cxxxxx) via extractors/vendor_mapping.py (optional)
+5) Resolve wallet code into Q_payment_method via extractors/wallet_mapping.py (optional)
+6) Robust date/amount parsing + safe Excel injection prevention
+7) Preserve metadata fields in rows (do not delete), but export only A–U columns
 """
 
-# ------------------------------------------------------------
-# Simple local helpers
-# ------------------------------------------------------------
-RE_TAX13 = re.compile(r"\b(\d{13})\b")
-RE_DATE_YYYYMMDD = re.compile(r"\b(\d{8})\b")
-RE_DATE_DMYYYY = re.compile(r"\b(\d{1,2})[\/\-. ](\d{1,2})[\/\-. ](\d{4})\b")
-RE_DATE_YYYYMD = re.compile(r"\b(\d{4})[\/\-. ](\d{1,2})[\/\-. ](\d{1,2})\b")
+from __future__ import annotations
 
-# invoice + reference
-RE_REF_CODE = re.compile(r"\b(\d{4}-\d{6,9})\b")
-RE_DOC_WITH_REF = re.compile(r"\b([A-Z]{2,}[A-Z0-9\-/_.]{6,})\s+(\d{4}-\d{6,9})\b", re.IGNORECASE)
+import csv
+import io
+import re
+import logging
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
+from typing import List, Dict, Any, Tuple, Optional, Set
 
-# Vendor word hints
-RE_VENDOR_SHOPEE = re.compile(r"(shopee|ช็อปปี้|ช้อปปี้)", re.IGNORECASE)
-RE_VENDOR_LAZADA = re.compile(r"(lazada|ลาซาด้า)", re.IGNORECASE)
-RE_VENDOR_TIKTOK = re.compile(r"(tiktok|ติ๊กต๊อก)", re.IGNORECASE)
-RE_VENDOR_SPX = re.compile(r"(spx\s*express|standard\s*express)", re.IGNORECASE)
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill, Border, Side, numbers
+from openpyxl.utils import get_column_letter
 
-RE_HAS_VAT7 = re.compile(r"(vat\s*7%|ภาษีมูลค่าเพิ่ม\s*7%|vat\s*amount|total\s*vat)", re.IGNORECASE)
-RE_NO_VAT = re.compile(r"(no\s*vat|ไม่มี\s*vat|vat\s*exempt|ยกเว้นภาษี)", re.IGNORECASE)
+logger = logging.getLogger(__name__)
 
-RE_PND_HINT = re.compile(r"(ภ\.ง\.ด\.?\s*53|pnd\s*53)", re.IGNORECASE)
+# =========================
+# PEAK Schema (A-U)
+# =========================
+COLUMNS: List[Tuple[str, str]] = [
+    ("A_seq", "ลำดับที่*"),
+    ("A_company_name", "ชื่อบริษัท"),
+    ("B_doc_date", "วันที่เอกสาร"),
+    ("C_reference", "อ้างอิงถึง"),
+    ("D_vendor_code", "ผู้รับเงิน/คู่ค้า"),
+    ("E_tax_id_13", "เลขทะเบียน 13 หลัก"),
+    ("F_branch_5", "เลขสาขา 5 หลัก"),
+    ("G_invoice_no", "เลขที่ใบกำกับฯ (ถ้ามี)"),
+    ("H_invoice_date", "วันที่ใบกำกับฯ (ถ้ามี)"),
+    ("I_tax_purchase_date", "วันที่บันทึกภาษีซื้อ (ถ้ามี)"),
+    ("J_price_type", "ประเภทราคา"),
+    ("K_account", "บัญชี"),
+    ("L_description", "คำอธิบาย"),
+    ("M_qty", "จำนวน"),
+    ("N_unit_price", "ราคาต่อหน่วย"),
+    ("O_vat_rate", "อัตราภาษี"),
+    ("P_wht", "หัก ณ ที่จ่าย (ถ้ามี)"),
+    ("Q_payment_method", "ชำระโดย"),
+    ("R_paid_amount", "จำนวนเงินที่ชำระ"),
+    ("S_pnd", "ภ.ง.ด. (ถ้ามี)"),
+    ("T_note", "หมายเหตุ"),
+    ("U_group", "กลุ่มจัดประเภท"),
+]
 
-RE_PAYMENT_DEDUCT = re.compile(r"(หักจากยอดขาย|deduct(?:ed)?\s*from\s*(?:sales|revenue))", re.IGNORECASE)
-RE_PAYMENT_TRANSFER = re.compile(r"(โอน|transfer|bank\s*transfer)", re.IGNORECASE)
-RE_PAYMENT_CARD = re.compile(r"(card|credit\s*card|visa|mastercard)", re.IGNORECASE)
-RE_PAYMENT_CASH = re.compile(r"(cash|เงินสด)", re.IGNORECASE)
+COL_KEYS: List[str] = [k for k, _ in COLUMNS]
+
+# =========================
+# Platforms / Rules
+# =========================
+PLATFORMS: Set[str] = {
+    "META", "GOOGLE", "SHOPEE", "LAZADA", "TIKTOK", "SPX", "THAI_TAX", "UNKNOWN"
+}
+
+# Vendor "names" (used as vendor hint/label; actual PEAK column D wants vendor code Cxxxxx in your workflow)
+PLATFORM_VENDOR_NAMES = {
+    "META": "Meta Platforms Ireland",
+    "GOOGLE": "Google Asia Pacific",
+    "SHOPEE": "Shopee",
+    "LAZADA": "Lazada",
+    "TIKTOK": "TikTok",
+    "SPX": "Shopee Express",
+    "THAI_TAX": "",   # variable
+    "UNKNOWN": "",
+}
+
+# VAT rules per platform
+# NOTE: VAT here is O_vat_rate (7% or NO). price type J_price_type:
+# 1 = VAT separated, 2 = VAT included, 3 = no VAT
+PLATFORM_VAT_RULES = {
+    "META":  {"J_price_type": "3", "O_vat_rate": "NO"},
+    "GOOGLE":{"J_price_type": "3", "O_vat_rate": "NO"},
+    "SHOPEE":{"J_price_type": "1", "O_vat_rate": "7%"},
+    "LAZADA":{"J_price_type": "1", "O_vat_rate": "7%"},
+    "TIKTOK":{"J_price_type": "1", "O_vat_rate": "7%"},
+    "SPX":  {"J_price_type": "1", "O_vat_rate": "7%"},
+    "THAI_TAX":{"J_price_type": "1", "O_vat_rate": "7%"},
+    "UNKNOWN":{"J_price_type": "1", "O_vat_rate": "7%"},
+}
+
+VAT_RATES: Set[str] = {"7%", "NO", ""}
+PRICE_TYPES: Set[str] = {"1", "2", "3", ""}
+PND_ALLOWED: Set[str] = {"", "1", "2", "3", "53"}
+
+# Expense groups (your canonical set)
+GROUPS: Set[str] = {
+    "Marketplace Expense",
+    "Advertising Expense",
+    "Delivery/Logistics Expense",
+    "General Expense",
+    "Inventory/COGS",
+    "Other Expense",
+    "",
+}
+
+PLATFORM_DEFAULT_GROUP = {
+    "META": "Advertising Expense",
+    "GOOGLE": "Advertising Expense",
+    "SHOPEE": "Marketplace Expense",
+    "LAZADA": "Marketplace Expense",
+    "TIKTOK": "Marketplace Expense",
+    "SPX": "Delivery/Logistics Expense",
+    "THAI_TAX": "General Expense",
+    "UNKNOWN": "Other Expense",
+}
+
+# =========================
+# Excel / CSV concerns
+# =========================
+TEXT_COL_KEYS: Set[str] = {
+    "A_seq",
+    "A_company_name",
+    "C_reference",
+    "D_vendor_code",
+    "E_tax_id_13",
+    "F_branch_5",
+    "G_invoice_no",
+    "J_price_type",
+    "O_vat_rate",
+    "S_pnd",
+    "Q_payment_method",
+}
+
+NUM_COL_KEYS: Set[str] = {"M_qty", "N_unit_price", "R_paid_amount"}
+
+DATE_COL_KEYS: Set[str] = {"B_doc_date", "H_invoice_date", "I_tax_purchase_date"}
+
+EXCEL_INJECTION_PREFIXES = ("=", "+", "-", "@")
+
+# Regex patterns
+RE_YYYYMMDD = re.compile(r"^\d{8}$")
+RE_YYYY_MM_DD = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+RE_DD_MM_YYYY = re.compile(r"^(\d{2})/(\d{2})/(\d{4})$")
+RE_YYYY_MM_DD_SLASH = re.compile(r"^(\d{4})/(\d{2})/(\d{2})$")
+RE_ALL_WS = re.compile(r"\s+")
+RE_AMOUNT_CLEAN = re.compile(r"[,\s]|฿|THB|บาท", re.IGNORECASE)
+
+MAX_ROWS = 50000
+MAX_CELL_LENGTH = 32767
+
+# =========================
+# Optional mappings (your project)
+# =========================
+try:
+    # expected in your repo: backend/app/extractors/vendor_mapping.py
+    from ..extractors.vendor_mapping import resolve_vendor_code  # type: ignore
+except Exception:  # pragma: no cover
+    resolve_vendor_code = None  # type: ignore
+
+try:
+    # expected in your repo: backend/app/extractors/wallet_mapping.py
+    from ..extractors.wallet_mapping import resolve_wallet_code  # type: ignore
+except Exception:  # pragma: no cover
+    resolve_wallet_code = None  # type: ignore
+
+# =========================
+# Exceptions
+# =========================
+class ExportValidationError(Exception):
+    """Raised when export data validation fails"""
+    pass
 
 
-# ------------------------------------------------------------
-# Configuration
-# ------------------------------------------------------------
-@dataclass
-class AIExtractConfig:
-    model: str = "gpt-4.1-mini"
-    temperature: float = 0.0
-    max_chars: int = 120_000
-    timeout_s: Optional[float] = None
-    enabled: bool = True
+class PlatformValidationError(Exception):
+    """Raised when platform-specific validation fails"""
+    pass
 
 
-def _blank_row() -> Dict[str, Any]:
-    row = {k: "" for k in PEAK_FIELDS}
-    row.update({
-        "A_seq": "1",
-        "M_qty": "1",
-        "J_price_type": "1",
-        "O_vat_rate": "7%",
-        "P_wht": "0",
-        "R_paid_amount": "0",
-        "N_unit_price": "0",
-        "F_branch_5": "00000",
-        "T_note": "",  # ✅ force empty note
-    })
-    return row
-
-
-def _to_money_2(x: Any) -> str:
-    if x is None:
+# =========================
+# Helpers
+# =========================
+def _s(v: Any) -> str:
+    if v is None:
         return ""
-    s = str(x).strip()
-    if s == "":
-        return ""
-    s = s.replace("฿", "").replace("THB", "").replace(",", "").strip()
     try:
-        d = Decimal(s)
+        s = str(v).strip()
+        if len(s) > MAX_CELL_LENGTH:
+            logger.warning(f"Cell value truncated (was {len(s)} chars)")
+            s = s[:MAX_CELL_LENGTH]
+        return s
+    except Exception:
+        return ""
+
+
+def _escape_excel_formula(s: str) -> str:
+    if not s:
+        return s
+    try:
+        return ("'" + s) if s[:1] in EXCEL_INJECTION_PREFIXES else s
+    except Exception:
+        return s
+
+
+def _compact_no_ws(v: Any) -> str:
+    s = _s(v)
+    if not s:
+        return ""
+    try:
+        return RE_ALL_WS.sub("", s)
+    except Exception:
+        return s
+
+
+def _to_tax13(v: Any) -> str:
+    s = _s(v)
+    if not s:
+        return ""
+    digits = "".join(c for c in s if c.isdigit())
+    return digits[:13] if len(digits) >= 13 else ""
+
+
+def _to_branch5(v: Any) -> str:
+    s = _s(v)
+    if not s:
+        return "00000"
+    digits = "".join(c for c in s if c.isdigit())
+    if not digits:
+        return "00000"
+    return digits.zfill(5)[:5]
+
+
+def _parse_date_to_yyyymmdd(date_str: Any) -> str:
+    if date_str is None:
+        return ""
+    s = _s(date_str)
+    if not s:
+        return ""
+    try:
+        if RE_YYYYMMDD.match(s):
+            return s
+
+        m = RE_YYYY_MM_DD.match(s)
+        if m:
+            return f"{m.group(1)}{m.group(2)}{m.group(3)}"
+
+        m = RE_YYYY_MM_DD_SLASH.match(s)
+        if m:
+            return f"{m.group(1)}{m.group(2)}{m.group(3)}"
+
+        m = RE_DD_MM_YYYY.match(s)
+        if m:
+            yyyy = int(m.group(3))
+            # Handle Buddhist year (>= 2400) → Gregorian
+            if yyyy >= 2400:
+                yyyy -= 543
+            return f"{yyyy:04d}{m.group(2)}{m.group(1)}"
+
+        # Try common formats
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d", "%d-%m-%Y"):
+            try:
+                dt = datetime.strptime(s, fmt)
+                return dt.strftime("%Y%m%d")
+            except ValueError:
+                continue
+
+        return ""
+    except Exception:
+        return ""
+
+
+def _parse_amount(amount_str: Any) -> str:
+    if amount_str is None:
+        return ""
+    s = _s(amount_str)
+    if not s:
+        return ""
+    try:
+        # keep minus? For your use case: expenses are positive; if negative, return ""
+        cleaned = RE_AMOUNT_CLEAN.sub("", s).strip()
+        if cleaned.startswith("(") and cleaned.endswith(")"):
+            cleaned = "-" + cleaned[1:-1]
+        cleaned = cleaned.replace("−", "-")
+        d = Decimal(cleaned)
         if d < 0:
             return ""
         return f"{d:.2f}"
@@ -133,327 +291,547 @@ def _to_money_2(x: Any) -> str:
         return ""
 
 
-def _to_tax13(x: Any) -> str:
-    if x is None:
-        return ""
-    digits = "".join(c for c in str(x) if c.isdigit())
-    return digits[:13] if len(digits) >= 13 else ""
+def _clamp_choice(v: Any, allowed: Set[str], fallback: str) -> str:
+    s = _s(v)
+    return s if s in allowed else fallback
 
 
-def _to_branch5(x: Any) -> str:
-    if x is None:
-        return "00000"
-    s = "".join(c for c in str(x) if c.isdigit())
-    if not s:
-        return "00000"
-    return s.zfill(5)[:5]
+def _append_note(rr: Dict[str, Any], msg: str, max_lines: int = 6) -> None:
+    msg = _s(msg)
+    if not msg:
+        return
+    cur = _s(rr.get("T_note"))
+    lines = [ln.strip() for ln in cur.splitlines() if ln.strip()] if cur else []
+    if msg not in lines:
+        lines.append(msg)
+    rr["T_note"] = "\n".join(lines[:max_lines])[:1500]
 
 
-def _parse_date_to_yyyymmdd(s: str) -> str:
-    if not s:
-        return ""
-    s = str(s).strip()
+# =========================
+# Platform detection
+# =========================
+def _detect_platform(row: Dict[str, Any]) -> str:
+    """
+    Detect platform from the row.
+    Priority:
+    1) _platform_detected (from AI)
+    2) _route_name
+    3) vendor name hint (if D_vendor_code currently contains vendor name)
+    4) group hint (if U_group looks like a group, do NOT treat as platform)
+    """
+    try:
+        p = _s(row.get("_platform_detected")).upper()
+        if p in PLATFORMS:
+            return p
 
-    if re.fullmatch(r"\d{8}", s):
-        try:
-            datetime.strptime(s, "%Y%m%d")
-            return s
-        except Exception:
-            return ""
+        route = _s(row.get("_route_name")).lower()
+        if "meta" in route:
+            return "META"
+        if "google" in route:
+            return "GOOGLE"
+        if "spx" in route or "shopee_express" in route or "shopee-express" in route:
+            return "SPX"
+        if "shopee" in route:
+            return "SHOPEE"
+        if "lazada" in route:
+            return "LAZADA"
+        if "tiktok" in route:
+            return "TIKTOK"
+        if "thai" in route and "tax" in route:
+            return "THAI_TAX"
 
-    m = RE_DATE_YYYYMD.search(s)
-    if m:
-        y, mo, d = m.group(1), m.group(2).zfill(2), m.group(3).zfill(2)
-        out = f"{y}{mo}{d}"
-        try:
-            datetime.strptime(out, "%Y%m%d")
-            return out
-        except Exception:
+        vendor = _s(row.get("D_vendor_code")).lower()
+        # if already a Cxxxxx code → can't infer platform from it reliably
+        if vendor.startswith("c") and vendor[1:].isdigit():
+            # try fallback from other fields
             pass
+        else:
+            if "meta" in vendor or "facebook" in vendor or "instagram" in vendor:
+                return "META"
+            if "google" in vendor:
+                return "GOOGLE"
+            if "shopee express" in vendor or "spx" in vendor:
+                return "SPX"
+            if "shopee" in vendor or "ช้อปปี้" in vendor or "ช็อปปี้" in vendor:
+                return "SHOPEE"
+            if "lazada" in vendor or "ลาซาด้า" in vendor:
+                return "LAZADA"
+            if "tiktok" in vendor or "ติ๊กต๊อก" in vendor:
+                return "TIKTOK"
 
-    m = RE_DATE_DMYYYY.search(s)
-    if m:
-        d, mo, y = m.group(1).zfill(2), m.group(2).zfill(2), m.group(3)
-        out = f"{y}{mo}{d}"
+        # If looks like Thai tax invoice (has tax id 13 + invoice no)
+        tax13 = _to_tax13(row.get("E_tax_id_13"))
+        inv = _s(row.get("G_invoice_no"))
+        if tax13 and inv:
+            return "THAI_TAX"
+
+        return "UNKNOWN"
+    except Exception:
+        return "UNKNOWN"
+
+
+# =========================
+# Platform enforcement
+# =========================
+def _enforce_platform_rules(rr: Dict[str, Any], platform: str) -> None:
+    # VAT rules
+    rules = PLATFORM_VAT_RULES.get(platform) or PLATFORM_VAT_RULES["UNKNOWN"]
+    rr["J_price_type"] = _clamp_choice(rr.get("J_price_type"), PRICE_TYPES, rules["J_price_type"])
+    rr["O_vat_rate"] = _clamp_choice(rr.get("O_vat_rate"), VAT_RATES, rules["O_vat_rate"])
+
+    # Default group (ensure it is a group, not platform code)
+    ug = _s(rr.get("U_group"))
+    if ug not in GROUPS:
+        rr["U_group"] = PLATFORM_DEFAULT_GROUP.get(platform, "Other Expense")
+    elif not ug:
+        rr["U_group"] = PLATFORM_DEFAULT_GROUP.get(platform, "Other Expense")
+
+    # Vendor name hint (kept as hint; actual PEAK D field should become vendor code Cxxxxx via mapping if possible)
+    # We'll only set vendor name if empty AND mapping later fails.
+    if not _s(rr.get("D_vendor_code")):
+        rr["D_vendor_code"] = PLATFORM_VENDOR_NAMES.get(platform, "") or ""
+
+
+# =========================
+# Vendor code mapping (Cxxxxx)
+# =========================
+def _maybe_resolve_vendor_code(rr: Dict[str, Any]) -> None:
+    """
+    Convert rr["D_vendor_code"] into PEAK vendor CODE (Cxxxxx) when possible,
+    based on your vendor_mapping.py (client_tax_id + vendor tax id/name).
+    Safe: if resolver not available or can't resolve, keep existing value.
+    """
+    if resolve_vendor_code is None:
+        return
+
+    # Your workflow: use client tax id to decide mapping table
+    client_tax_id = _to_tax13(rr.get("_client_tax_id") or rr.get("client_tax_id") or rr.get("A_company_tax_id"))
+    vendor_tax_id = _to_tax13(rr.get("E_tax_id_13"))
+    vendor_name = _s(rr.get("_vendor_name_hint") or rr.get("D_vendor_code"))
+
+    try:
+        code = resolve_vendor_code(
+            client_tax_id=client_tax_id,
+            vendor_tax_id=vendor_tax_id,
+            vendor_name=vendor_name,
+        )
+        if code:
+            rr["D_vendor_code"] = _s(code)
+            return
+    except Exception as e:
+        logger.warning(f"resolve_vendor_code error: {e}")
+
+    # If cannot resolve, keep existing D_vendor_code as-is
+
+
+# =========================
+# Wallet code mapping (EWLxxx)
+# =========================
+def _maybe_resolve_wallet(rr: Dict[str, Any]) -> None:
+    """
+    If wallet_mapping.py exists, set Q_payment_method to wallet code
+    using seller_id/shop_name/ocr hints stored in metadata.
+    Safe fallback: keep existing.
+    """
+    if resolve_wallet_code is None:
+        return
+
+    # Prefer metadata from extract step
+    seller_id = _s(rr.get("_seller_id") or rr.get("seller_id"))
+    shop_name = _s(rr.get("_shop_name") or rr.get("shop_name"))
+    ocr_text_hint = _s(rr.get("_ocr_text_hint") or "")
+
+    # If already set and looks like EWLxxx, keep it
+    cur = _s(rr.get("Q_payment_method"))
+    if cur.upper().startswith("EWL") and cur[3:].isdigit():
+        return
+
+    try:
+        code = resolve_wallet_code(
+            seller_id=seller_id,
+            shop_name=shop_name,
+            text=ocr_text_hint,
+        )
+        if code:
+            rr["Q_payment_method"] = _s(code)
+    except Exception as e:
+        logger.warning(f"resolve_wallet_code error: {e}")
+
+
+# =========================
+# Validation notes
+# =========================
+def _platform_validation_notes(rr: Dict[str, Any], platform: str) -> None:
+    # lightweight: do not block export, just add warnings
+    if platform in {"META", "GOOGLE"}:
+        if _s(rr.get("O_vat_rate")).upper() != "NO":
+            _append_note(rr, f"⚠️ {platform}: VAT ควรเป็น NO")
+        if not _s(rr.get("C_reference")):
+            _append_note(rr, f"⚠️ {platform}: ไม่มีเลขอ้างอิง (C_reference)")
+        if not _s(rr.get("R_paid_amount")):
+            _append_note(rr, f"⚠️ {platform}: ไม่มีจำนวนเงินชำระ (R_paid_amount)")
+
+    if platform == "THAI_TAX":
+        if len(_to_tax13(rr.get("E_tax_id_13"))) != 13:
+            _append_note(rr, "⚠️ THAI_TAX: ไม่พบเลขผู้เสียภาษี 13 หลักของผู้ขาย")
+        if len(_to_branch5(rr.get("F_branch_5"))) != 5:
+            _append_note(rr, "⚠️ THAI_TAX: เลขสาขาควรเป็น 5 หลัก (00000 ได้)")
+        if not _s(rr.get("G_invoice_no")):
+            _append_note(rr, "⚠️ THAI_TAX: ควรมีเลขที่ใบกำกับฯ")
+
+
+# =========================
+# Preprocess
+# =========================
+def _preprocess_rows_for_export(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seq = 1
+
+    logger.info(f"Preprocessing {len(rows)} rows...")
+
+    for idx, r in enumerate(rows or [], start=1):
         try:
-            datetime.strptime(out, "%Y%m%d")
-            return out
-        except Exception:
-            pass
+            rr = dict(r or {})
 
-    return ""
+            # 1) detect platform
+            platform = _detect_platform(rr)
+            rr["_platform_final"] = platform  # keep metadata for debugging
 
+            # 2) enforce platform rules
+            _enforce_platform_rules(rr, platform)
 
-def _normalize_text_for_heuristics(text: str) -> str:
-    if not text:
-        return ""
-    t = str(text).replace("\r\n", "\n").replace("\r", "\n")
-    t = re.sub(r"[\u200b-\u200f\ufeff]", "", t)
-    lines = [re.sub(r"[ \t\f\v]+", " ", ln).strip() for ln in t.split("\n")]
-    return "\n".join(lines).strip()
+            # 3) sequence
+            rr["A_seq"] = str(seq)
+            seq += 1
 
+            # 4) policy: WHT blank (as your current policy)
+            rr["P_wht"] = ""
 
-def _guess_vendor_code(text: str) -> str:
-    t = _normalize_text_for_heuristics(text)
-    if RE_VENDOR_SPX.search(t):
-        return "SPX"
-    if RE_VENDOR_SHOPEE.search(t):
-        return "Shopee"
-    if RE_VENDOR_LAZADA.search(t):
-        return "Lazada"
-    if RE_VENDOR_TIKTOK.search(t):
-        return "TikTok"
-    return "Other"
+            # 5) normalize tax/branch
+            rr["E_tax_id_13"] = _to_tax13(rr.get("E_tax_id_13"))
+            rr["F_branch_5"] = _to_branch5(rr.get("F_branch_5"))
 
+            # 6) parse dates
+            for dk in DATE_COL_KEYS:
+                rr[dk] = _parse_date_to_yyyymmdd(rr.get(dk))
 
-def _guess_vat_mode(text: str) -> Tuple[str, str]:
-    t = _normalize_text_for_heuristics(text)
-    if RE_NO_VAT.search(t):
-        return ("3", "NO")
-    if RE_HAS_VAT7.search(t):
-        return ("1", "7%")
-    return ("1", "7%")
+            # 7) parse amounts
+            # qty: allow integer-like
+            qty = _parse_amount(rr.get("M_qty"))
+            rr["M_qty"] = (str(int(float(qty))) if qty and abs(float(qty) - int(float(qty))) < 1e-9 else (_s(rr.get("M_qty")) or "1"))
+            rr["N_unit_price"] = _parse_amount(rr.get("N_unit_price"))
+            rr["R_paid_amount"] = _parse_amount(rr.get("R_paid_amount"))
 
+            # fallback: paid_amount from unit_price if missing
+            if not rr["R_paid_amount"] and rr["N_unit_price"]:
+                rr["R_paid_amount"] = rr["N_unit_price"]
 
-def _guess_payment_method(text: str) -> str:
-    t = _normalize_text_for_heuristics(text)
-    if RE_PAYMENT_DEDUCT.search(t):
-        return "หักจากยอดขาย"
-    if RE_PAYMENT_TRANSFER.search(t):
-        return "โอน"
-    if RE_PAYMENT_CARD.search(t):
-        return "CARD"
-    if RE_PAYMENT_CASH.search(t):
-        return "เงินสด"
-    return ""
+            # 8) compact ids
+            rr["C_reference"] = _compact_no_ws(rr.get("C_reference"))
+            rr["G_invoice_no"] = _compact_no_ws(rr.get("G_invoice_no"))
 
+            # 9) ensure strings and not None for critical
+            rr["A_company_name"] = _s(rr.get("A_company_name"))
+            for key in ("D_vendor_code", "E_tax_id_13", "F_branch_5", "J_price_type", "O_vat_rate", "S_pnd", "Q_payment_method"):
+                if rr.get(key) is None:
+                    rr[key] = ""
 
-def _guess_pnd(text: str, wht_amount: str) -> str:
-    t = _normalize_text_for_heuristics(text)
-    if wht_amount and wht_amount not in ("0", "0.00", ""):
-        if RE_PND_HINT.search(t):
-            return "53"
-        return "53"
-    return ""
+            # 10) clamp vat / price_type / pnd
+            rr["O_vat_rate"] = _clamp_choice(rr.get("O_vat_rate"), VAT_RATES, PLATFORM_VAT_RULES.get(platform, PLATFORM_VAT_RULES["UNKNOWN"])["O_vat_rate"])
+            rr["J_price_type"] = _clamp_choice(rr.get("J_price_type"), PRICE_TYPES, PLATFORM_VAT_RULES.get(platform, PLATFORM_VAT_RULES["UNKNOWN"])["J_price_type"])
+            rr["S_pnd"] = _clamp_choice(rr.get("S_pnd"), PND_ALLOWED, "")
 
+            # 11) mapping: vendor code Cxxxxx (สำคัญ)
+            _maybe_resolve_vendor_code(rr)
 
-def _find_first_non_client_tax_id(text: str) -> str:
-    t = _normalize_text_for_heuristics(text)
-    for m in RE_TAX13.finditer(t):
-        tax = m.group(1)
-        if tax not in CLIENT_TAX_IDS:
-            return tax
-    return ""
+            # 12) mapping: wallet code EWLxxx (ถ้ามี)
+            _maybe_resolve_wallet(rr)
 
+            # 13) validate notes (non-blocking)
+            _platform_validation_notes(rr, platform)
 
-def _find_best_doc_with_ref(text: str) -> str:
-    t = _normalize_text_for_heuristics(text)
-    m = RE_DOC_WITH_REF.search(t)
-    if m:
-        return f"{m.group(1)} {m.group(2)}"
-    return ""
+            # 14) keep note clean + prevent injection
+            rr["T_note"] = _escape_excel_formula(_s(rr.get("T_note")))
 
+            # 15) If description empty: use group
+            if not _s(rr.get("L_description")):
+                rr["L_description"] = rr.get("U_group") or PLATFORM_DEFAULT_GROUP.get(platform, "Other Expense")
 
-def _safe_str(x: Any) -> str:
-    if x is None:
-        return ""
-    return str(x).strip()
+            out.append(rr)
 
+        except Exception as e:
+            logger.error(f"Error preprocessing row {idx}: {e}", exc_info=True)
+            continue
 
-def _clamp_choice(val: str, allowed: List[str], fallback: str) -> str:
-    v = _safe_str(val)
-    return v if v in allowed else fallback
-
-
-def _validate_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    out = _blank_row()
-
-    for k in PEAK_FIELDS:
-        if k in row:
-            out[k] = _safe_str(row.get(k, ""))
-
-    out["A_seq"] = out["A_seq"] or "1"
-    out["M_qty"] = out["M_qty"] or "1"
-
-    out["E_tax_id_13"] = _to_tax13(out.get("E_tax_id_13"))
-    out["F_branch_5"] = _to_branch5(out.get("F_branch_5"))
-
-    for dk in ["B_doc_date", "H_invoice_date", "I_tax_purchase_date"]:
-        out[dk] = _parse_date_to_yyyymmdd(out.get(dk, ""))
-
-    out["N_unit_price"] = _to_money_2(out.get("N_unit_price")) or out["N_unit_price"]
-    out["R_paid_amount"] = _to_money_2(out.get("R_paid_amount")) or out["R_paid_amount"]
-    out["P_wht"] = _to_money_2(out.get("P_wht")) if out.get("P_wht") not in ("", "0") else "0"
-
-    out["D_vendor_code"] = _clamp_choice(out.get("D_vendor_code", ""), VENDOR_CODES, "Other")
-    out["U_group"] = _clamp_choice(out.get("U_group", ""), GROUPS, "Other Expense")
-
-    if out.get("J_price_type") not in ("1", "2", "3"):
-        out["J_price_type"] = "1"
-    if out.get("O_vat_rate") not in ("7%", "NO"):
-        out["O_vat_rate"] = "7%"
-
-    if not out["C_reference"] and out["G_invoice_no"]:
-        out["C_reference"] = out["G_invoice_no"]
-    if not out["G_invoice_no"] and out["C_reference"]:
-        out["G_invoice_no"] = out["C_reference"]
-
-    # ✅ Force empty note always (design requirement)
-    out["T_note"] = ""
-
+    logger.info(f"Preprocessing complete: {len(out)} rows ready")
     return out
 
 
-def _fill_missing_with_heuristics(row: Dict[str, Any], full_text: str) -> Dict[str, Any]:
-    t = _normalize_text_for_heuristics(full_text)
+# =========================
+# Validation
+# =========================
+def validate_rows(rows: List[Dict[str, Any]]) -> Tuple[bool, List[str]]:
+    errors: List[str] = []
 
-    if not row.get("D_vendor_code") or row["D_vendor_code"] == "Other":
-        row["D_vendor_code"] = _guess_vendor_code(t)
+    if not rows:
+        return (False, ["No rows to export"])
 
-    if not row.get("J_price_type") or not row.get("O_vat_rate"):
-        jp, vr = _guess_vat_mode(t)
-        row["J_price_type"] = row.get("J_price_type") or jp
-        row["O_vat_rate"] = row.get("O_vat_rate") or vr
+    if len(rows) > MAX_ROWS:
+        return (False, [f"Too many rows: {len(rows)} (max: {MAX_ROWS})"])
 
-    if not row.get("Q_payment_method"):
-        row["Q_payment_method"] = _guess_payment_method(t)
+    # check basic structure in first 100 rows
+    for idx, row in enumerate(rows[:100], start=1):
+        if not isinstance(row, dict):
+            errors.append(f"Row {idx}: Not a dictionary")
+            continue
+        if not any(_s(row.get(k)) for k in COL_KEYS):
+            errors.append(f"Row {idx}: All fields empty")
 
-    if not row.get("E_tax_id_13"):
-        tax = _find_first_non_client_tax_id(t)
-        if tax:
-            row["E_tax_id_13"] = tax
-
-    if not row.get("F_branch_5"):
-        row["F_branch_5"] = "00000"
-
-    if not row.get("G_invoice_no"):
-        doc = _find_best_doc_with_ref(t)
-        if doc:
-            row["G_invoice_no"] = doc
-            row["C_reference"] = row.get("C_reference") or doc
-
-    if not row.get("B_doc_date"):
-        # best-effort: take latest yyyyMMdd if any appear
-        dates: List[str] = []
-        for m in RE_DATE_YYYYMMDD.finditer(t):
-            y = _parse_date_to_yyyymmdd(m.group(1))
-            if y:
-                dates.append(y)
-        for m in RE_DATE_YYYYMD.finditer(t):
-            y = _parse_date_to_yyyymmdd(f"{m.group(1)}-{m.group(2)}-{m.group(3)}")
-            if y:
-                dates.append(y)
-        for m in RE_DATE_DMYYYY.finditer(t):
-            y = _parse_date_to_yyyymmdd(f"{m.group(1)}/{m.group(2)}/{m.group(3)}")
-            if y:
-                dates.append(y)
-
-        if dates:
-            best = max(dates)
-            row["B_doc_date"] = best
-            row["H_invoice_date"] = row.get("H_invoice_date") or best
-            row["I_tax_purchase_date"] = row.get("I_tax_purchase_date") or best
-
-    if (row.get("P_wht") and row["P_wht"] not in ("0", "0.00")) and not row.get("S_pnd"):
-        row["S_pnd"] = _guess_pnd(t, row["P_wht"])
-
-    if not row.get("U_group"):
-        row["U_group"] = "Marketplace Expense" if row.get("D_vendor_code") in ("Shopee", "Lazada", "TikTok", "SPX") else "Other Expense"
-
-    if not row.get("L_description"):
-        if row.get("U_group") in ("Marketplace Expense", "Advertising Expense", "Inventory/COGS"):
-            row["L_description"] = row["U_group"]
-        else:
-            row["L_description"] = "Other Expense"
-
-    # ✅ Do NOT create notes (design requirement)
-    row["T_note"] = ""
-
-    return row
+    return (len(errors) == 0, errors)
 
 
-# ------------------------------------------------------------
-# Main AI extraction
-# ------------------------------------------------------------
-def extract_with_ai(full_text: str, filename: str = "", client_tax_id: str = "") -> Dict[str, Any]:
-    """
-    AI-assisted extraction for PEAK A–U.
-
-    ✅ Design rules enforced:
-    - If AI fails: return {"_ai_error": "..."} ONLY (no PEAK columns mutated here)
-    - T_note always empty
-    - Normal success returns PEAK_FIELDS only
-    """
-    base = _blank_row()
-
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    cfg = AIExtractConfig(
-        model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-        temperature=float(os.getenv("OPENAI_TEMPERATURE", "0") or "0"),
-        max_chars=int(os.getenv("OPENAI_MAX_CHARS", "120000") or "120000"),
-        enabled=(os.getenv("AI_EXTRACT_ENABLED", "1").strip() != "0"),
-    )
-
-    text = (full_text or "")[: cfg.max_chars]
-
-    user_payload = {
-        "filename": filename,
-        "client_tax_id": client_tax_id or "",
-        "template_fields": PEAK_FIELDS,
-        "hints": {
-            "vendor_code_guess": _guess_vendor_code(text),
-            "vat_guess": {"J_price_type": _guess_vat_mode(text)[0], "O_vat_rate": _guess_vat_mode(text)[1]},
-            "payment_guess": _guess_payment_method(text),
-            "doc_with_ref_guess": _find_best_doc_with_ref(text),
-            "vendor_tax_id_guess": _find_first_non_client_tax_id(text),
-        },
-        "document_text": text,
-    }
-
-    # If disabled or no key: return empty base (no error metadata)
-    if not (cfg.enabled and api_key):
-        out = _fill_missing_with_heuristics(dict(base), full_text=text)
-        out = _validate_row(out)
-        return {k: out.get(k, "") for k in PEAK_FIELDS}
-
-    # ✅ Important: on ANY exception, return _ai_error metadata ONLY
+# =========================
+# Type Conversion
+# =========================
+def _to_number_or_text(key: str, raw: Any) -> Tuple[Any, str]:
     try:
-        client = OpenAI(api_key=api_key)
+        s = _s(raw)
 
-        resp = client.chat.completions.create(
-            model=cfg.model,
-            temperature=cfg.temperature,
-            messages=[
-                {"role": "system", "content": SYSTEM},
-                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-            ],
-            response_format={"type": "json_object"},
-        )
+        # Always text
+        if key in TEXT_COL_KEYS or key in DATE_COL_KEYS:
+            return (_escape_excel_formula(s), numbers.FORMAT_TEXT)
 
-        content = resp.choices[0].message.content or "{}"
-        ai_data = json.loads(content) if content.strip() else {}
-        if not isinstance(ai_data, dict):
-            ai_data = {}
+        # Numeric fields
+        if key in NUM_COL_KEYS:
+            if key == "M_qty":
+                parsed = _parse_amount(s)
+                if parsed:
+                    try:
+                        f = float(parsed)
+                        if abs(f - int(f)) < 1e-9:
+                            return (int(f), "0")
+                        return (f, numbers.FORMAT_NUMBER_00)
+                    except Exception:
+                        pass
+                return (_escape_excel_formula(s), numbers.FORMAT_TEXT)
 
-        row = dict(base)
-        for k in PEAK_FIELDS:
-            v = ai_data.get(k, "")
-            row[k] = "" if v is None else str(v).strip()
+            parsed = _parse_amount(s)
+            if parsed:
+                try:
+                    return (float(parsed), numbers.FORMAT_NUMBER_00)
+                except Exception:
+                    pass
+            return (_escape_excel_formula(s), numbers.FORMAT_TEXT)
 
-        # enforce design constraints
-        row["T_note"] = ""
+        return (_escape_excel_formula(s), numbers.FORMAT_TEXT)
+    except Exception:
+        return ("", numbers.FORMAT_TEXT)
 
-        row = _validate_row(row)
-        row = _fill_missing_with_heuristics(row, full_text=text)
-        row = _validate_row(row)
 
-        return {k: row.get(k, "") for k in PEAK_FIELDS}
+# =========================
+# Auto-fit Columns
+# =========================
+def _auto_fit_columns(ws, max_width: int = 60, min_width: int = 10) -> None:
+    try:
+        for col_idx, (_key, label) in enumerate(COLUMNS, start=1):
+            col_letter = get_column_letter(col_idx)
+            max_len = len(str(label))
 
+            max_check = min(ws.max_row + 1, 102)
+            for row_idx in range(2, max_check):
+                try:
+                    v = ws.cell(row=row_idx, column=col_idx).value
+                    if v is None:
+                        continue
+                    s = str(v)
+                    if "\n" in s:
+                        s = s.split("\n", 1)[0]
+                    max_len = max(max_len, len(s))
+                except Exception:
+                    continue
+
+            ws.column_dimensions[col_letter].width = int(min(max(max_len + 2, min_width), max_width))
     except Exception as e:
-        # ✅ Required behavior: metadata only, no PEAK columns, no T_note pollution
-        msg = f"{type(e).__name__}: {str(e)}"
-        msg = msg[:500]
-        return {"_ai_error": msg}
+        logger.error(f"Auto-fit columns error: {e}")
 
 
-__all__ = ["extract_with_ai", "PEAK_FIELDS"]
+# =========================
+# CSV Export
+# =========================
+def export_rows_to_csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
+    try:
+        logger.info(f"Starting CSV export for {len(rows)} rows")
+
+        is_valid, errors = validate_rows(rows)
+        if not is_valid:
+            raise ExportValidationError("; ".join(errors))
+
+        rows2 = _preprocess_rows_for_export(rows)
+        if not rows2:
+            raise ExportValidationError("No valid rows after preprocessing")
+
+        out = io.StringIO()
+        wri = csv.writer(out, quoting=csv.QUOTE_MINIMAL)
+
+        wri.writerow([label for _k, label in COLUMNS])
+
+        for r in rows2:
+            row_out: List[str] = []
+            for k, _label in COLUMNS:
+                s = _escape_excel_formula(_s(r.get(k, "")))
+                row_out.append(s)
+            wri.writerow(row_out)
+
+        result = out.getvalue().encode("utf-8-sig")
+        logger.info(f"✅ CSV export complete: {len(result)} bytes")
+        return result
+
+    except ExportValidationError:
+        raise
+    except Exception as e:
+        logger.error(f"CSV export error: {e}", exc_info=True)
+        raise Exception(f"CSV export failed: {str(e)}")
+
+
+# =========================
+# XLSX Export
+# =========================
+def export_rows_to_xlsx_bytes(rows: List[Dict[str, Any]]) -> bytes:
+    try:
+        logger.info(f"Starting XLSX export for {len(rows)} rows")
+
+        is_valid, errors = validate_rows(rows)
+        if not is_valid:
+            raise ExportValidationError("; ".join(errors))
+
+        rows2 = _preprocess_rows_for_export(rows)
+        if not rows2:
+            raise ExportValidationError("No valid rows after preprocessing")
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "PEAK_IMPORT"
+
+        headers = [label for _k, label in COLUMNS]
+        ws.append(headers)
+
+        header_fill = PatternFill("solid", fgColor="E8F1FF")
+        header_font = Font(bold=True)
+        header_align = Alignment(vertical="center", horizontal="center", wrap_text=True)
+
+        thin = Side(style="thin", color="D0D7E2")
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+        for col_idx in range(1, len(COLUMNS) + 1):
+            c = ws.cell(row=1, column=col_idx)
+            c.fill = header_fill
+            c.font = header_font
+            c.alignment = header_align
+            c.border = border
+
+        for _row_num, r in enumerate(rows2, start=2):
+            values: List[Any] = []
+            formats: List[str] = []
+
+            for k, _label in COLUMNS:
+                v, fmt = _to_number_or_text(k, r.get(k, ""))
+                values.append(v)
+                formats.append(fmt)
+
+            ws.append(values)
+
+            current_row = ws.max_row
+            for col_idx, fmt in enumerate(formats, start=1):
+                cell = ws.cell(row=current_row, column=col_idx)
+                if fmt:
+                    cell.number_format = fmt
+                cell.alignment = Alignment(vertical="top", wrap_text=(col_idx in {13, 21}))
+                cell.border = border
+
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(COLUMNS))}1"
+
+        col_index = {k: i + 1 for i, (k, _) in enumerate(COLUMNS)}
+        for key in (TEXT_COL_KEYS | DATE_COL_KEYS):
+            ci = col_index.get(key)
+            if not ci:
+                continue
+            for row_i in range(2, 2 + len(rows2)):
+                try:
+                    ws.cell(row=row_i, column=ci).number_format = numbers.FORMAT_TEXT
+                except Exception:
+                    continue
+
+        _auto_fit_columns(ws)
+
+        bio = io.BytesIO()
+        wb.save(bio)
+        result = bio.getvalue()
+        logger.info(f"✅ XLSX export complete: {len(result)} bytes")
+        return result
+
+    except ExportValidationError:
+        raise
+    except Exception as e:
+        logger.error(f"XLSX export error: {e}", exc_info=True)
+        raise Exception(f"XLSX export failed: {str(e)}")
+
+
+# =========================
+# Summary
+# =========================
+def get_export_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    try:
+        summary = {
+            "total_rows": len(rows),
+            "valid_rows": 0,
+            "platforms": {},
+            "extraction_methods": {},
+            "clients": {},
+            "date_range": {"earliest": None, "latest": None},
+            "total_amount": 0.0,
+            "warnings": [],
+        }
+
+        for row in rows or []:
+            if _s(row.get("D_vendor_code")):
+                summary["valid_rows"] += 1
+
+            platform = _detect_platform(row)
+            summary["platforms"][platform] = summary["platforms"].get(platform, 0) + 1
+
+            method = _s(row.get("_extraction_method")) or "unknown"
+            summary["extraction_methods"][method] = summary["extraction_methods"].get(method, 0) + 1
+
+            company = _s(row.get("A_company_name")) or "Unknown"
+            summary["clients"][company] = summary["clients"].get(company, 0) + 1
+
+            doc_date = _parse_date_to_yyyymmdd(row.get("B_doc_date"))
+            if doc_date:
+                if not summary["date_range"]["earliest"] or doc_date < summary["date_range"]["earliest"]:
+                    summary["date_range"]["earliest"] = doc_date
+                if not summary["date_range"]["latest"] or doc_date > summary["date_range"]["latest"]:
+                    summary["date_range"]["latest"] = doc_date
+
+            amt = _parse_amount(row.get("R_paid_amount"))
+            if amt:
+                try:
+                    summary["total_amount"] += float(amt)
+                except Exception:
+                    pass
+
+        return summary
+    except Exception as e:
+        logger.error(f"Error getting export summary: {e}")
+        return {"error": str(e)}
+
+
+__all__ = [
+    "COLUMNS",
+    "export_rows_to_csv_bytes",
+    "export_rows_to_xlsx_bytes",
+    "ExportValidationError",
+    "PlatformValidationError",
+    "validate_rows",
+    "get_export_summary",
+]

@@ -1,0 +1,9 @@
+This is likely a Meta (Facebook) Ads receipt/transaction.
+Extract fields for PEAK when possible.
+Rules:
+- Do NOT guess shop/brand name; if missing, leave empty.
+- Prefer Transaction ID / Account ID if present.
+Return JSON patch for PEAK fields only.
+
+TEXT:
+{{TEXT}}

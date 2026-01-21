@@ -15,13 +15,24 @@
     HASHTAG: { label: "HASHTAG", taxId: "",            tokens: ["hashtag","#hashtag","hash tag","hash-tag"] },
   };
 
+  // ✅ UI labels (chips) + tokens for filename inference
   const PLATFORMS = {
     SHOPEE:   { label: "SHOPEE",   tokens: ["shopee","spay"] },
     LAZADA:   { label: "LAZADA",   tokens: ["lazada","laz"] },
     TIKTOK:   { label: "TIKTOK",   tokens: ["tiktok","tts","ttshop","tik tok","tt_"] },
-    SPX:      { label: "SPX",      tokens: ["spx","shopee express","shopee-express"] },
+    SPX:      { label: "SPX",      tokens: ["spx","shopee express","shopee-express","shopee  express"] },
     FACEBOOK: { label: "FACEBOOK", tokens: ["facebook","fb","meta"] },
     OTHER:    { label: "OTHER",    tokens: [] },
+  };
+
+  // ✅ backend expects lowercase classifier labels
+  const PLATFORM_TO_BACKEND = {
+    SHOPEE: "shopee",
+    LAZADA: "lazada",
+    TIKTOK: "tiktok",
+    SPX: "spx",
+    FACEBOOK: "other",
+    OTHER: "other",
   };
 
   const state = {
@@ -30,19 +41,25 @@
     rows: [],
     filter: "all",
     q: "",
-    backendUrl: localStorage.getItem("peak_backend_url") || "http://localhost:8000",
+    backendUrl: (localStorage.getItem("peak_backend_url") || "http://localhost:8000").replace(/\/$/, ""),
     pollTimer: null,
     editMode: false,
 
     // ✅ pre-upload filters (multi select)
-    clientFilters: new Set(),    // e.g. {"SHD","RABBIT"}
-    platformFilters: new Set(),  // e.g. {"SHOPEE","TIKTOK"}
+    clientFilters: new Set(),
+    platformFilters: new Set(),
 
     // ✅ remember which filters used for each job (local)
     jobConfig: null,
-    
-    // ✅ NEW: filter strictness mode
-    strictMode: false,  // false = allow unknown files, true = reject unknown files
+
+    // ✅ filter strictness
+    strictMode: false,
+
+    // ✅ NEW: compute WHT (ภาษีหัก ณ ที่จ่าย)
+    computeWht: true,
+
+    // ✅ balloons guard
+    balloonFiredForJob: "",
   };
 
   const LS_HISTORY_KEY = "peak_job_history_v1";
@@ -82,7 +99,9 @@
 
   const NON_EDITABLE = new Set(["_status","_source_file","A_company_name"]);
 
-  // ---- utils ----
+  // =========================================================
+  // utils
+  // =========================================================
   function setBackendUrl(v){
     state.backendUrl = (v || "").trim().replace(/\/$/, "");
     localStorage.setItem("peak_backend_url", state.backendUrl);
@@ -116,15 +135,23 @@
     return `state=${job.state} · files ${done}/${total} · OK ${ok} · Review ${rev} · Error ${err}`;
   }
 
+  function safeSetText(id, txt){
+    const x = el(id);
+    if(x) x.textContent = txt;
+  }
+  function safeSetDisabled(id, on){
+    const x = el(id);
+    if(x) x.disabled = !!on;
+  }
+
   // =========================================================
-  // ✅ Infer (จากชื่อไฟล์) - แก้ไขให้แม่นกว่าเดิม
+  // ✅ Infer (filename)
   // =========================================================
   function normalizeName(s){
-    // แปลง underscore, dash, dot เป็น space ก่อน lowercase
     return String(s || "")
       .toLowerCase()
-      .replace(/[_\-\.]/g, " ")  // ✅ แปลง _ - . เป็น space
-      .replace(/\s+/g, " ")      // collapse spaces
+      .replace(/[_\-\.]/g, " ")
+      .replace(/\s+/g, " ")
       .trim();
   }
 
@@ -132,15 +159,9 @@
     const s = normalizeName(name);
     for(const t of tokens || []){
       if(!t) continue;
-      
-      // ✅ แปลง token ให้ตรงกับ normalizeName
       const tNorm = normalizeName(t);
-      
-      // ใช้ word boundary เพื่อป้องกัน partial match
-      // เช่น "shopee" ไม่ควรตรงกับ "shopeexpress"
       const escaped = tNorm.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const rx = new RegExp(`\\b${escaped}\\b`, "i");
-      
       if(rx.test(s)) return true;
     }
     return false;
@@ -148,29 +169,23 @@
 
   function inferClientTagFromFilename(filename){
     const s = normalizeName(filename);
-    
-    // ✅ Check ตาม priority (specific → general)
     for(const [tag, config] of Object.entries(CLIENTS)){
       const tokens = config.tokens || [];
       if(tokens.length && includesAnyToken(s, tokens)){
         return tag;
       }
     }
-    
-    return null;  // ✅ ไม่พบ → return null (ไม่ใช่ default)
+    return null;
   }
 
   function inferPlatformFromFilename(filename){
     const s = normalizeName(filename);
-    
-    // ✅ Check ตาม priority (SPX ก่อน SHOPEE เพราะ shopee express ต้องเป็น SPX)
-    if(/\b(spx|shopee express|shopee\s*express)\b/.test(s)) return "SPX";
+    if(/\b(spx|shopee\s*express|shopee-express)\b/.test(s)) return "SPX";
     if(/\bshopee\b/.test(s)) return "SHOPEE";
     if(/\b(lazada|laz)\b/.test(s)) return "LAZADA";
     if(/\b(tiktok|tts|ttshop|tik\s*tok)\b/.test(s)) return "TIKTOK";
     if(/\b(facebook|fb|meta)\b/.test(s)) return "FACEBOOK";
-    
-    return null;  // ✅ ไม่พบ → return null (ไม่ใช่ "OTHER")
+    return null;
   }
 
   // =========================================================
@@ -190,7 +205,6 @@
   }
 
   function deriveCompanyNameFromRow(row){
-    // 1) ถ้า backend มีส่งมา (optional) จะใช้ก่อน
     const clientTaxId = String(row._client_tax_id || row.client_tax_id || "").trim();
     if(clientTaxId){
       if(clientTaxId === CLIENT_RABBIT) return "RABBIT";
@@ -200,13 +214,11 @@
     const clientTag = String(row._client_tag || row.client_tag || "").trim().toUpperCase();
     if(clientTag && CLIENTS[clientTag]) return CLIENTS[clientTag].label;
 
-    // 2) fallback จาก config ตอน upload (ถ้าเลือกบริษัทเดียว)
     if(state.jobConfig?.clientTags?.length === 1){
       const only = state.jobConfig.clientTags[0];
       if(CLIENTS[only]) return CLIENTS[only].label;
     }
 
-    // 3) fallback เดาจากชื่อไฟล์
     const src = String(row._source_file || "");
     const inferred = inferClientTagFromFilename(src);
     if(inferred && CLIENTS[inferred]) return CLIENTS[inferred].label;
@@ -223,29 +235,19 @@
   }
 
   // =========================================================
-  // ✅ Snow (ของเดิม)
+  // ✅ Snow CSS (เดิม)
   // =========================================================
   function ensureSnowCSS(){
     if(document.getElementById("snowStyle_v1")) return;
 
     const css = `
-/* ===== Snow (scoped) ===== */
 .backendSnow{ position:relative; overflow:hidden; }
 .backendSnow .snowBox{
-  position:absolute;
-  inset:0;
-  pointer-events:none;
-  z-index:0;
-  border-radius: inherit;
+  position:absolute; inset:0; pointer-events:none; z-index:0; border-radius: inherit;
 }
-.backendSnow > *:not(.snowBox){
-  position:relative;
-  z-index:1;
-}
+.backendSnow > *:not(.snowBox){ position:relative; z-index:1; }
 .snowflake{
-  position:absolute;
-  top:-22px;
-  will-change: transform, opacity;
+  position:absolute; top:-22px; will-change: transform, opacity;
   filter: drop-shadow(0 6px 10px rgba(20,40,90,.16));
   animation-name: snowFall_v1;
   animation-timing-function: linear;
@@ -256,21 +258,18 @@
   10%  { opacity: 1; }
   100% { transform: translate3d(var(--drift, 0px), calc(100% + 90px), 0); opacity: 0.05; }
 }
-
-/* ===== Settings chip row ===== */
 .chipRow{ display:flex; gap:8px; flex-wrap:wrap; }
 .chip.ghost{ opacity:.82; }
-
-/* ===== Filter details ===== */
 .filterDetails{
   font-size: 0.85rem;
-  color: #666;
-  margin-top: 0.5rem;
-  padding: 0.5rem;
-  background: #f5f5f5;
-  border-radius: 4px;
+  color: rgba(11,23,51,.72);
+  margin-top: 0.6rem;
+  padding: 0.55rem 0.65rem;
+  background: rgba(255,255,255,.55);
+  border: 1px solid rgba(20,40,90,.10);
+  border-radius: 10px;
 }
-.filterDetails strong{ color: #333; }
+.filterDetails strong{ color: rgba(11,23,51,.92); }
     `.trim();
 
     const style = document.createElement("style");
@@ -287,7 +286,6 @@
     snowContainer.innerHTML = "";
 
     const snowflakes = ["❄","❅","❆"];
-
     for(let i = 0; i < snowflakeCount; i++){
       const snowflake = document.createElement("div");
       snowflake.className = "snowflake";
@@ -325,7 +323,84 @@
     });
   }
 
-  // ---- history ----
+  // =========================================================
+  // ✅ Balloon FX (เดิม)
+  // =========================================================
+  function ensureBalloonCSS(){
+    if(document.getElementById("balloonStyle_v1")) return;
+    const css = `
+.balloonsLayer{
+  position:fixed;
+  inset:0;
+  pointer-events:none;
+  z-index:9999;
+}
+.balloon{
+  position:absolute;
+  bottom:-120px;
+  width:74px;
+  height:92px;
+  border-radius: 50% 50% 48% 48%;
+  box-shadow: 0 18px 30px rgba(20,40,90,.18);
+  border: 1px solid rgba(255,255,255,.45);
+  transform: translate3d(-50%,0,0);
+  animation: balloonRise_v1 5.3s ease-in forwards;
+}
+.balloon::after{
+  content:"";
+  position:absolute;
+  left:50%;
+  bottom:-16px;
+  width:2px;
+  height:18px;
+  background: rgba(20,40,90,.18);
+  transform: translateX(-50%);
+}
+@keyframes balloonRise_v1{
+  0%   { transform: translate3d(-50%, 0, 0) scale(.96); opacity: 0; }
+  10%  { opacity: 1; }
+  100% { transform: translate3d(-50%, -115vh, 0) scale(1.04); opacity: 0; }
+}
+    `.trim();
+    const style = document.createElement("style");
+    style.id = "balloonStyle_v1";
+    style.textContent = css;
+    document.head.appendChild(style);
+  }
+
+  function launchBalloonsOnce(jobId){
+    const key = jobId || "nojob";
+    if(state.balloonFiredForJob === key) return;
+    state.balloonFiredForJob = key;
+
+    ensureBalloonCSS();
+
+    const layer = document.createElement("div");
+    layer.className = "balloonsLayer";
+    document.body.appendChild(layer);
+
+    const lefts = [24, 52, 78];
+    const colors = [
+      "linear-gradient(180deg, rgba(140,210,255,.95), rgba(120,160,255,.85))",
+      "linear-gradient(180deg, rgba(190,255,210,.95), rgba(120,210,170,.85))",
+      "linear-gradient(180deg, rgba(255,200,230,.95), rgba(210,140,255,.85))"
+    ];
+
+    for(let i=0;i<3;i++){
+      const b = document.createElement("div");
+      b.className = "balloon";
+      b.style.left = lefts[i] + "%";
+      b.style.background = colors[i];
+      b.style.animationDelay = (i * 0.35) + "s";
+      layer.appendChild(b);
+    }
+
+    setTimeout(() => { try{ layer.remove(); }catch(e){} }, 5600);
+  }
+
+  // =========================================================
+  // History
+  // =========================================================
   function loadHistory(){
     try{
       const raw = localStorage.getItem(LS_HISTORY_KEY);
@@ -357,7 +432,9 @@
     }catch(_){ return String(dtISO || ""); }
   }
 
-  // ---- edits persistence ----
+  // =========================================================
+  // edits persistence
+  // =========================================================
   function loadEdits(backendUrl, jobId){
     try{
       const raw = localStorage.getItem(LS_EDITS_PREFIX + jobKey(backendUrl, jobId));
@@ -379,7 +456,9 @@
     }
   }
 
-  // ---- filter (ตาราง) ----
+  // =========================================================
+  // Filter (results table)
+  // =========================================================
   function matchRow(row){
     if(state.filter !== "all"){
       if(String(row._status||"").toUpperCase() !== state.filter) return false;
@@ -395,7 +474,9 @@
     return true;
   }
 
-  // ---- table render ----
+  // =========================================================
+  // Table render
+  // =========================================================
   function renderTable(){
     const thead = el("thead");
     const tbody = el("tbody");
@@ -406,7 +487,7 @@
       COLUMNS.map(([k, label]) => `<th title="${escapeHtml(k)}">${escapeHtml(label)}</th>`).join("") +
       "</tr>";
 
-    const filtered = state.rows.filter(matchRow);
+    const filtered = (state.rows || []).filter(matchRow);
 
     const rowsHtml = filtered.map((r, idx) => {
       const cls = (String(r._status||"") === "NEEDS_REVIEW") ? "review" : "";
@@ -455,7 +536,7 @@
     const inputs = tbody.querySelectorAll("input.cellEdit[data-ri][data-k]");
     if(!inputs.length) return;
 
-    const filtered = state.rows.filter(matchRow);
+    const filtered = (state.rows || []).filter(matchRow);
 
     inputs.forEach((inp) => {
       const ri = Number(inp.getAttribute("data-ri"));
@@ -467,7 +548,9 @@
     });
   }
 
-  // ---- queue ----
+  // =========================================================
+  // Queue render (job.files)
+  // =========================================================
   function renderQueue(job){
     const q = el("queue");
     if(!q) return;
@@ -496,7 +579,9 @@
     }).join("");
   }
 
-  // ---- progress UI ----
+  // =========================================================
+  // Progress UI
+  // =========================================================
   function setProgressUI(job){
     const done = job?.processed_files || 0;
     const total = job?.total_files || 0;
@@ -532,7 +617,9 @@
     }
   }
 
-  // ---- api ----
+  // =========================================================
+  // API wrapper
+  // =========================================================
   async function api(path, opts = {}){
     const url = state.backendUrl + path;
     const res = await fetch(url, opts);
@@ -543,21 +630,23 @@
     return res;
   }
 
-  // ---- polling ----
+  // =========================================================
+  // Polling
+  // =========================================================
   async function pollJob(){
     if(!state.jobId) return;
     try{
       const job = await (await api(`/api/job/${state.jobId}`)).json();
 
-      const jm = el("jobMeta");
-      if(jm) jm.textContent = formatJobMeta(job);
-
+      safeSetText("jobMeta", formatJobMeta(job));
       setProgressUI(job);
       renderQueue(job);
 
       if(job.state === "done" || job.state === "error"){
-        clearInterval(state.pollTimer);
-        state.pollTimer = null;
+        if(state.pollTimer){
+          clearInterval(state.pollTimer);
+          state.pollTimer = null;
+        }
 
         state.jobConfig = loadJobCfg(state.backendUrl, state.jobId) || null;
 
@@ -568,10 +657,10 @@
         enrichRowsForUI();
         renderTable();
 
-        el("btnCsv").disabled = false;
-        el("btnXlsx").disabled = false;
-        el("btnCsvEdited").disabled = state.rows.length === 0;
-        el("btnXlsxEdited").disabled = state.rows.length === 0;
+        safeSetDisabled("btnCsv", false);
+        safeSetDisabled("btnXlsx", false);
+        safeSetDisabled("btnCsvEdited", state.rows.length === 0);
+        safeSetDisabled("btnXlsxEdited", state.rows.length === 0);
 
         pushHistory({
           jobId: state.jobId,
@@ -584,17 +673,23 @@
           review_files: job.review_files || 0,
           error_files: job.error_files || 0,
           rows_count: state.rows.length,
-
           clientTags: state.jobConfig?.clientTags || [],
           platforms: state.jobConfig?.platforms || [],
+          computeWht: !!state.jobConfig?.computeWht,
         });
+
+        if(job.state === "done"){
+          launchBalloonsOnce(state.jobId);
+        }
       }
     }catch(e){
       console.warn(e);
     }
   }
 
-  // ---- History Modal ----
+  // =========================================================
+  // History Modal
+  // =========================================================
   function openModal(){
     const m = el("historyModal");
     if(!m) return;
@@ -634,7 +729,8 @@
         `Error=${h.error_files || 0}`,
         `rows=${h.rows_count || 0}`,
         (h.clientTags?.length ? `client=${h.clientTags.join("+")}` : ""),
-        (h.platforms?.length ? `platform=${h.platforms.join("+")}` : "")
+        (h.platforms?.length ? `platform=${h.platforms.join("+")}` : ""),
+        (typeof h.computeWht === "boolean" ? `WHT=${h.computeWht ? "on" : "off"}` : ""),
       ].filter(Boolean).join(" · ");
 
       return `
@@ -668,20 +764,20 @@
         if(backendSelect) backendSelect.value = backendUrl;
 
         state.jobId = jobId;
+        state.balloonFiredForJob = "";
 
-        const jm = el("jobMeta");
-        if(jm) jm.textContent = `job_id=${state.jobId} · loading...`;
+        safeSetText("jobMeta", `job_id=${state.jobId} · loading...`);
 
-        el("btnCsv").disabled = true;
-        el("btnXlsx").disabled = true;
-        el("btnCsvEdited").disabled = true;
-        el("btnXlsxEdited").disabled = true;
+        safeSetDisabled("btnCsv", true);
+        safeSetDisabled("btnXlsx", true);
+        safeSetDisabled("btnCsvEdited", true);
+        safeSetDisabled("btnXlsxEdited", true);
 
         try{
           state.jobConfig = loadJobCfg(state.backendUrl, state.jobId) || null;
 
           const job = await (await api(`/api/job/${state.jobId}`)).json();
-          if(jm) jm.textContent = formatJobMeta(job);
+          safeSetText("jobMeta", formatJobMeta(job));
           setProgressUI(job);
           renderQueue(job);
 
@@ -692,14 +788,16 @@
           enrichRowsForUI();
           renderTable();
 
-          el("btnCsv").disabled = false;
-          el("btnXlsx").disabled = false;
-          el("btnCsvEdited").disabled = state.rows.length === 0;
-          el("btnXlsxEdited").disabled = state.rows.length === 0;
+          safeSetDisabled("btnCsv", false);
+          safeSetDisabled("btnXlsx", false);
+          safeSetDisabled("btnCsvEdited", state.rows.length === 0);
+          safeSetDisabled("btnXlsxEdited", state.rows.length === 0);
+
+          if(job.state === "done") launchBalloonsOnce(state.jobId);
 
           closeModal();
         }catch(e){
-          alert("โหลดไม่สำเร็จ (job อาจ expired): " + e.message);
+          alert("โหลดไม่สำเร็จ (job อาจ expired): " + (e?.message || e));
         }
       });
     });
@@ -716,7 +814,9 @@
     });
   }
 
-  // ---- edit mode ----
+  // =========================================================
+  // Edit mode
+  // =========================================================
   function setEditMode(on){
     state.editMode = !!on;
     const btnSave = el("btnSave");
@@ -731,12 +831,14 @@
     readEditsFromDOM();
     saveEdits(state.backendUrl, state.jobId, state.rows);
     setEditMode(false);
-    el("btnCsvEdited").disabled = state.rows.length === 0;
-    el("btnXlsxEdited").disabled = state.rows.length === 0;
+    safeSetDisabled("btnCsvEdited", state.rows.length === 0);
+    safeSetDisabled("btnXlsxEdited", state.rows.length === 0);
     alert("บันทึกแล้ว ✅ (เก็บในเครื่อง + Export ได้)");
   }
 
-  // ---- export edited CSV/XLSX ----
+  // =========================================================
+  // Export edited CSV/XLSX (client-side)
+  // =========================================================
   function downloadBlob(blob, filename){
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -758,7 +860,7 @@
 
   function exportEditedCSV(){
     const header = COLUMNS.map(([,label]) => label).join(",");
-    const lines = state.rows.map((r) => COLUMNS.map(([k]) => csvEscape(r[k] ?? "")).join(","));
+    const lines = (state.rows || []).map((r) => COLUMNS.map(([k]) => csvEscape(r[k] ?? "")).join(","));
     const csv = [header, ...lines].join("\r\n");
     const blob = new Blob(["\ufeff", csv], { type: "text/csv;charset=utf-8" });
     downloadBlob(blob, `peak_AU_edited_${state.jobId || "nojob"}.csv`);
@@ -766,7 +868,7 @@
 
   function exportEditedXLSX(){
     const cols = COLUMNS.map(([k,label]) => ({ k, label }));
-    const rowsHtml = state.rows.map((r) => {
+    const rowsHtml = (state.rows || []).map((r) => {
       const tds = cols.map(c => `<td>${escapeHtml(String(r[c.k] ?? ""))}</td>`).join("");
       return `<tr>${tds}</tr>`;
     }).join("");
@@ -785,7 +887,9 @@
     downloadBlob(blob, `peak_AU_edited_${state.jobId || "nojob"}.xls`);
   }
 
-  // ---- horizontal dock sync ----
+  // =========================================================
+  // Horizontal dock sync (เดิม)
+  // =========================================================
   let hsyncLock = false;
 
   function syncHScrollGeometry(){
@@ -835,7 +939,7 @@
   }
 
   // =========================================================
-  // ✅ Pre-upload filter controls - แก้ไขให้ชัดเจนและแม่นยำ
+  // Pre-upload filter controls
   // =========================================================
   function toggleChip(btn, isOn){
     if(!btn) return;
@@ -851,11 +955,23 @@
       const p = String(b.getAttribute("data-platform") || "").toUpperCase();
       toggleChip(b, state.platformFilters.has(p));
     });
+
+    const strictEl = el("strictMode");
+    if(strictEl && strictEl.type === "checkbox"){
+      strictEl.checked = !!state.strictMode;
+    }
+
+    const whtEl = el("computeWht");
+    if(whtEl && whtEl.type === "checkbox"){
+      whtEl.checked = !!state.computeWht;
+    }
   }
 
   function setButtonsEnabled(hasFiles){
-    el("btnUpload").disabled = !hasFiles;
-    el("btnClear").disabled = !hasFiles;
+    const up = el("btnUpload");
+    const cl = el("btnClear");
+    if(up) up.disabled = !hasFiles;
+    if(cl) cl.disabled = !hasFiles;
   }
 
   function setUploadInfo(extraNote = ""){
@@ -872,48 +988,29 @@
     info.textContent = extraNote ? `${base} · ${extraNote}` : base;
   }
 
-  /**
-   * ✅ แก้ไข: Pre-filter logic ที่ชัดเจนและแม่นยำ
-   * 
-   * กฎการกรอง:
-   * 1. ถ้าไม่มี filter ใดๆ → ให้ทุกไฟล์ผ่าน
-   * 2. ถ้ามี client filter:
-   *    - infer ได้ + อยู่ใน filter → KEEP
-   *    - infer ได้ + ไม่อยู่ใน filter → SKIP
-   *    - infer ไม่ได้ → ขึ้นอยู่กับ strictMode:
-   *      * strictMode = false (default) → KEEP (ให้โอกาส)
-   *      * strictMode = true → SKIP (เข้มงวด)
-   * 3. ถ้ามี platform filter: (logic เดียวกัน)
-   * 4. ถ้ามีทั้ง client และ platform filter → ต้องผ่านทั้ง 2 เงื่อนไข
-   */
   function prefilterFilesBeforeUpload(files){
     const doClient = state.clientFilters.size > 0;
     const doPlat = state.platformFilters.size > 0;
 
-    // ✅ ถ้าไม่มี filter → ให้ทุกไฟล์ผ่าน
     if(!doClient && !doPlat){
-      return { kept: files, skipped: [], details: [] };
+      return { kept: files, skipped: [], details: [], note: "" };
     }
 
     const kept = [];
     const skipped = [];
-    const details = [];  // ✅ เก็บรายละเอียดเพื่อแสดง UI
+    const details = [];
 
     for(const f of files){
       const fname = f?.name || "";
-      const clientTag = inferClientTagFromFilename(fname);  // null if unknown
-      const platformTag = inferPlatformFromFilename(fname); // null if unknown
+      const clientTag = inferClientTagFromFilename(fname);
+      const platformTag = inferPlatformFromFilename(fname);
 
       let passClient = true;
       let passPlatform = true;
       let reason = "";
 
-      // ============================================================
-      // ✅ CLIENT FILTER
-      // ============================================================
       if(doClient){
         if(clientTag){
-          // ✅ เดาได้ → ตรวจสอบว่าอยู่ใน filter หรือไม่
           if(state.clientFilters.has(clientTag)){
             passClient = true;
           }else{
@@ -921,96 +1018,99 @@
             reason = `client=${clientTag} (ไม่อยู่ใน filter)`;
           }
         }else{
-          // ✅ เดาไม่ได้ → ขึ้นอยู่กับ strictMode
           if(state.strictMode){
             passClient = false;
             reason = "client=unknown (strict mode)";
           }else{
-            passClient = true;  // ✅ ให้โอกาส (default)
+            passClient = true;
           }
         }
       }
 
-      // ============================================================
-      // ✅ PLATFORM FILTER
-      // ============================================================
       if(doPlat){
         if(platformTag){
-          // ✅ เดาได้ → ตรวจสอบว่าอยู่ใน filter หรือไม่
           if(state.platformFilters.has(platformTag)){
             passPlatform = true;
           }else{
             passPlatform = false;
-            const prevReason = reason;
-            reason = prevReason
-              ? `${prevReason}, platform=${platformTag} (ไม่อยู่ใน filter)`
+            reason = reason
+              ? `${reason}, platform=${platformTag} (ไม่อยู่ใน filter)`
               : `platform=${platformTag} (ไม่อยู่ใน filter)`;
           }
         }else{
-          // ✅ เดาไม่ได้ → ขึ้นอยู่กับ strictMode
           if(state.strictMode){
             passPlatform = false;
-            const prevReason = reason;
-            reason = prevReason
-              ? `${prevReason}, platform=unknown (strict mode)`
+            reason = reason
+              ? `${reason}, platform=unknown (strict mode)`
               : "platform=unknown (strict mode)";
           }else{
-            passPlatform = true;  // ✅ ให้โอกาส (default)
+            passPlatform = true;
           }
         }
       }
 
-      // ============================================================
-      // ✅ FINAL DECISION
-      // ============================================================
       const pass = passClient && passPlatform;
 
       if(pass){
         kept.push(f);
         details.push({
           filename: fname,
-          status: "✅ KEEP",
+          status: "KEEP",
           client: clientTag || "unknown",
-          platform: platformTag || "unknown"
+          platform: platformTag || "unknown",
         });
       }else{
         skipped.push(f);
         details.push({
           filename: fname,
-          status: "❌ SKIP",
+          status: "SKIP",
           client: clientTag || "unknown",
           platform: platformTag || "unknown",
-          reason: reason || "ไม่ตรง filter"
+          reason: reason || "ไม่ตรง filter",
         });
       }
     }
 
-    // ✅ สร้าง summary note
     let note = "";
-    if(skipped.length > 0){
-      note = `ข้าม ${skipped.length} ไฟล์ (ไม่ตรง filter)`;
-    }
-    if(kept.length === 0 && files.length > 0){
-      note = "⚠️ ทุกไฟล์ถูกข้าม - ลองปรับ filter";
-    }
+    if(skipped.length > 0) note = `ข้าม ${skipped.length} ไฟล์ (ไม่ตรง filter)`;
+    if(kept.length === 0 && files.length > 0) note = "⚠️ ทุกไฟล์ถูกข้าม - ลองปรับ filter";
 
     return { kept, skipped, details, note };
   }
 
   function currentJobCfgFromFilters(){
     const clientTags = Array.from(state.clientFilters);
-    const platforms = Array.from(state.platformFilters);
+    const platformsUI = Array.from(state.platformFilters);
 
     const clientTaxIds = clientTags
       .map(t => CLIENTS[t]?.taxId)
       .filter(Boolean);
 
-    return { clientTags, clientTaxIds, platforms, savedAt: nowISO() };
+    const platforms = platformsUI
+      .map(p => PLATFORM_TO_BACKEND[p] || "")
+      .filter(Boolean);
+
+    const uniq = (arr) => {
+      const s = new Set();
+      const out = [];
+      for(const x of arr){
+        if(!x || s.has(x)) continue;
+        s.add(x);
+        out.push(x);
+      }
+      return out;
+    };
+
+    return {
+      clientTags: uniq(clientTags),
+      clientTaxIds: uniq(clientTaxIds),
+      platforms: uniq(platforms),
+      strictMode: !!state.strictMode,
+      computeWht: !!state.computeWht,
+      savedAt: nowISO()
+    };
   }
 
-  /**
-   * ✅ แสดงรายละเอียดการกรอง (optional - ถ้าต้องการ)
-   */
   function showFilterDetails(details){
     const container = el("filterDetails");
     if(!container) return;
@@ -1020,37 +1120,38 @@
       return;
     }
 
-    const kept = details.filter(d => d.status === "✅ KEEP");
-    const skipped = details.filter(d => d.status === "❌ SKIP");
+    const kept = details.filter(d => d.status === "KEEP");
+    const skipped = details.filter(d => d.status === "SKIP");
 
     let html = `<div class="filterDetails">`;
     html += `<strong>รายละเอียดการกรอง:</strong><br>`;
     html += `✅ เก็บ: ${kept.length} ไฟล์<br>`;
     html += `❌ ข้าม: ${skipped.length} ไฟล์<br>`;
-    
-    if(skipped.length > 0 && skipped.length <= 10){
-      html += `<br><strong>ไฟล์ที่ข้าม:</strong><br>`;
-      skipped.forEach(d => {
+
+    if(skipped.length > 0){
+      html += `<br><strong>ตัวอย่างไฟล์ที่ข้าม:</strong><br>`;
+      skipped.slice(0, 10).forEach(d => {
         html += `• ${escapeHtml(d.filename)} (${escapeHtml(d.reason || "")})<br>`;
       });
+      if(skipped.length > 10){
+        html += `… และอีก ${skipped.length - 10} ไฟล์<br>`;
+      }
     }
-    
+
     html += `</div>`;
     container.innerHTML = html;
     container.style.display = "block";
   }
 
-  // ---- bind ----
+  // =========================================================
+  // Bind UI
+  // =========================================================
   function bind(){
-    // =========================================================
-    // ✅ Backend preset + sync
-    // =========================================================
     const backendUrlInput = el("backendUrl");
     const backendSelect = el("backendSelect");
 
-    const DEFAULT_BACKEND = "https://ai-1-dq7u.onrender.com";
+    const DEFAULT_BACKEND = "https://ooo-taen.onrender.com";
     const saved = localStorage.getItem("peak_backend_url");
-
     setBackendUrl(saved || DEFAULT_BACKEND);
 
     if(backendUrlInput) backendUrlInput.value = state.backendUrl;
@@ -1071,9 +1172,21 @@
       }
     });
 
-    // =========================================================
-    // ✅ Settings chips
-    // =========================================================
+    const strictEl = el("strictMode");
+    if(strictEl && strictEl.type === "checkbox"){
+      strictEl.addEventListener("change", () => {
+        state.strictMode = !!strictEl.checked;
+      });
+    }
+
+    // ✅ NEW: WHT toggle
+    const whtEl = el("computeWht");
+    if(whtEl && whtEl.type === "checkbox"){
+      whtEl.addEventListener("change", () => {
+        state.computeWht = !!whtEl.checked;
+      });
+    }
+
     document.querySelectorAll("[data-client]").forEach((btn) => {
       btn.addEventListener("click", () => {
         const tag = String(btn.getAttribute("data-client") || "").toUpperCase();
@@ -1112,12 +1225,11 @@
       syncFilterChipsUI();
     });
 
+    // default UI sync
     syncFilterChipsUI();
 
-    // =========================================================
-    // ✅ File picker
-    // =========================================================
-    el("btnPick")?.addEventListener("click", () => el("file").click());
+    // File picker
+    el("btnPick")?.addEventListener("click", () => el("file")?.click());
 
     const fileInput = el("file");
     fileInput?.addEventListener("change", () => {
@@ -1126,7 +1238,7 @@
       setUploadInfo();
     });
 
-    // drag drop
+    // Drag drop
     const drop = el("drop");
     drop?.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("isOver"); });
     drop?.addEventListener("dragleave", () => drop.classList.remove("isOver"));
@@ -1146,99 +1258,101 @@
       setUploadInfo();
     });
 
-    // upload
+    // Upload
     el("btnUpload")?.addEventListener("click", async () => {
       if(!state.files.length) return;
 
       setEditMode(false);
+      safeSetDisabled("btnUpload", true);
 
-      el("btnUpload").disabled = true;
       state.jobId = null;
       state.rows = [];
+      state.balloonFiredForJob = "";
       renderTable();
 
-      // ✅ pre-filter ก่อนส่งขึ้น backend (ปรับปรุงแล้ว)
-      const { kept, skipped, details, note } = prefilterFilesBeforeUpload(state.files);
-
-      // ✅ แสดงรายละเอียดการกรอง (optional)
-      if(typeof showFilterDetails === "function"){
-        showFilterDetails(details);
-      }
+      const { kept, details, note } = prefilterFilesBeforeUpload(state.files);
+      showFilterDetails(details);
 
       if(!kept.length){
         alert(
           "⚠️ ไม่มีไฟล์ที่ตรงกับ Filter ที่เลือก (ทุกไฟล์ถูกข้ามหมด)\n\n" +
           "แนะนำ:\n" +
-          "• กด 'Clear' ที่ Client/Platform filter\n" +
-          "• เลือก filter ใหม่\n" +
-          "• ตรวจสอบชื่อไฟล์ว่ามี keyword หรือไม่\n\n" +
-          `ไฟล์ที่ข้าม: ${skipped.length} ไฟล์`
+          "• กด Clear ที่ Client/Platform filter\n" +
+          "• ปิด Strict Mode\n" +
+          "• ตรวจชื่อไฟล์ให้มี keyword เช่น shopee / tiktok / shd / rabbit\n"
         );
-        el("btnUpload").disabled = false;
+        safeSetDisabled("btnUpload", false);
         return;
       }
 
       setUploadInfo(note);
 
-      el("jobMeta").textContent = "uploading...";
+      safeSetText("jobMeta", "uploading...");
       setProgressUI({ processed_files: 0, total_files: kept.length, ok_files: 0, review_files: 0, state: "uploading" });
 
       const fd = new FormData();
       kept.forEach((f) => fd.append("files", f, f.name));
 
-      // ✅ แนบ settings เพิ่ม (backend จะ ignore ก็ไม่พัง)
+      // cfg -> backend (ต้องส่งครบ!)
       const cfg = currentJobCfgFromFilters();
       fd.append("client_tags", (cfg.clientTags || []).join(","));
       fd.append("client_tax_ids", (cfg.clientTaxIds || []).join(","));
       fd.append("platforms", (cfg.platforms || []).join(","));
+      fd.append("strict_mode", cfg.strictMode ? "1" : "0");
+      fd.append("compute_wht", cfg.computeWht ? "1" : "0");
 
       try{
         const res = await (await api("/api/upload", { method: "POST", body: fd })).json();
         state.jobId = res.job_id;
 
-        // ✅ เก็บ cfg ของงานนี้ เพื่อเติม "ชื่อบริษัท" แม่นขึ้น
         saveJobCfg(state.backendUrl, state.jobId, cfg);
         state.jobConfig = cfg;
 
-        el("jobMeta").textContent = `job_id=${state.jobId} · processing...`;
-        el("btnCsv").disabled = true;
-        el("btnXlsx").disabled = true;
-        el("btnCsvEdited").disabled = true;
-        el("btnXlsxEdited").disabled = true;
+        const extra = [];
+        if(typeof res.files_added === "number") extra.push(`added=${res.files_added}`);
+        if(typeof res.files_skipped === "number") extra.push(`skipped=${res.files_skipped}`);
+        safeSetText("jobMeta", `job_id=${state.jobId} · processing... ${extra.length ? "(" + extra.join(", ") + ")" : ""}`);
+
+        safeSetDisabled("btnCsv", true);
+        safeSetDisabled("btnXlsx", true);
+        safeSetDisabled("btnCsvEdited", true);
+        safeSetDisabled("btnXlsxEdited", true);
 
         if(state.pollTimer) clearInterval(state.pollTimer);
         state.pollTimer = setInterval(pollJob, 1200);
         pollJob();
       }catch(e){
-        alert("Upload error: " + e.message);
+        alert("Upload error: " + (e?.message || e));
       }finally{
-        el("btnUpload").disabled = false;
+        safeSetDisabled("btnUpload", false);
       }
     });
 
+    // Clear
     el("btnClear")?.addEventListener("click", () => {
       setEditMode(false);
       state.files = [];
       state.jobId = null;
       state.rows = [];
-      fileInput.value = "";
+      state.balloonFiredForJob = "";
+      if(fileInput) fileInput.value = "";
       setButtonsEnabled(false);
       setUploadInfo();
-      el("jobMeta").textContent = "—";
-      el("btnCsv").disabled = true;
-      el("btnXlsx").disabled = true;
-      el("btnCsvEdited").disabled = true;
-      el("btnXlsxEdited").disabled = true;
-      el("queue").innerHTML = `<div class="muted small">ยังไม่มีงาน</div>`;
+      safeSetText("jobMeta", "—");
+      safeSetDisabled("btnCsv", true);
+      safeSetDisabled("btnXlsx", true);
+      safeSetDisabled("btnCsvEdited", true);
+      safeSetDisabled("btnXlsxEdited", true);
+      const q = el("queue");
+      if(q) q.innerHTML = `<div class="muted small">ยังไม่มีงาน</div>`;
       setProgressUI(null);
       renderTable();
-      
-      // ✅ ซ่อนรายละเอียด filter
+
       const detailsEl = el("filterDetails");
       if(detailsEl) detailsEl.style.display = "none";
     });
 
-    // filter chips (ผลลัพธ์)
+    // Results filter chips
     document.querySelectorAll(".chip[data-filter]").forEach((btn) => {
       btn.addEventListener("click", () => {
         document.querySelectorAll(".chip[data-filter]").forEach(b => b.classList.remove("active"));
@@ -1248,13 +1362,13 @@
       });
     });
 
-    // search
+    // Search
     el("q")?.addEventListener("input", (e) => {
       state.q = e.target.value.trim();
       renderTable();
     });
 
-    // export raw
+    // Export raw (backend)
     el("btnCsv")?.addEventListener("click", () => {
       if(!state.jobId) return;
       window.open(`${state.backendUrl}/api/export/${state.jobId}.csv`, "_blank");
@@ -1264,7 +1378,7 @@
       window.open(`${state.backendUrl}/api/export/${state.jobId}.xlsx`, "_blank");
     });
 
-    // export edited
+    // Export edited (frontend)
     el("btnCsvEdited")?.addEventListener("click", () => {
       if(state.editMode) readEditsFromDOM();
       exportEditedCSV();
@@ -1274,7 +1388,7 @@
       exportEditedXLSX();
     });
 
-    // edit mode
+    // Edit mode
     el("btnEdit")?.addEventListener("click", () => {
       if(!state.rows.length){
         alert("ยังไม่มีข้อมูลให้แก้ไข");
@@ -1288,7 +1402,7 @@
       saveEditsNow();
     });
 
-    // history
+    // History
     el("btnHistory")?.addEventListener("click", openModal);
     el("btnClearHistory")?.addEventListener("click", () => {
       if(confirm("ล้างประวัติทั้งหมด?")) clearHistory();
@@ -1299,10 +1413,8 @@
     });
     window.addEventListener("keydown", (e) => { if(e.key === "Escape") closeModal(); });
 
-    // horizontal dock sync
     bindHScrollSync();
 
-    // initial
     renderTable();
     setButtonsEnabled(false);
     setUploadInfo();
@@ -1311,9 +1423,12 @@
     syncHScrollGeometry();
   }
 
-  // ✅ start
+  // =========================================================
+  // Start
+  // =========================================================
   document.addEventListener("DOMContentLoaded", () => {
     bind();
     initSnow();
   });
+
 })();

@@ -1,0 +1,23 @@
+Given the TEXT, classify the segment into one of:
+- meta_ads
+- google_ads
+- marketplace
+- generic
+
+Also extract any of:
+- seller_id
+- transaction_id
+- invoice_no
+- vendor_tax_id_13
+
+Return JSON:
+{
+  "route": "meta_ads|google_ads|marketplace|generic",
+  "seller_id": "",
+  "transaction_id": "",
+  "invoice_no": "",
+  "vendor_tax_id_13": ""
+}
+
+TEXT:
+{{TEXT}}

@@ -1,4 +1,4 @@
-<!doctype html> 
+<!doctype html>
 <html lang="th">
 <head>
   <meta charset="utf-8" />
@@ -24,79 +24,110 @@
           <div class="sub">PEAK A–U · Realtime Progress + Edit + History</div>
         </div>
       </div>
-<!-- ✅ Backend URL (Redesigned / Collapsible) -->
-<details class="card backendCard" id="backendDrop">
-  <summary class="backendHeader">
-    <div class="backendTitleWrap">
-      <div class="backendTitle">Backend URL</div>
-    </div>
 
-    <div class="backendToggle">
-      <span class="chev">▾</span>
-    </div>
-  </summary>
+      <!-- ✅ Backend URL (Redesigned / Collapsible) -->
+      <details class="card backendCard backendSnow" id="backendDrop">
+        <summary class="backendHeader">
+          <div class="backendTitleWrap">
+            <div class="backendTitle">Backend URL</div>
+            <div class="backendSub muted small">คลิกเพื่อเปิด/ปิดการตั้งค่า</div>
+          </div>
 
-  <div class="backendBody">
-    <div class="field">
-      <label>เลือกปลายทาง (Preset)</label>
-      <select id="backendSelect">
-        <option value="https://ai-1-dq7u.onrender.com">
-          Render (แนะนำ) · https://ai-1-dq7u.onrender.com
-        </option>
-        <option value="http://localhost:8000">
-          Local · http://localhost:8000
-        </option>
-      </select>
-    </div>
+          <div class="backendToggle" aria-hidden="true">
+            <span class="chev">▾</span>
+          </div>
+        </summary>
 
-    <div class="field">
-      <label>เชื่อมต่อ API (แก้ไขเองได้)</label>
-      <input
-        id="backendUrl"
-        placeholder="https://ai-1-dq7u.onrender.com"
-      />
-    </div>
-  </div>
-</details>
+        <div class="backendBody">
+          <!-- ✅ keep your snow container (only visible when opened) -->
+          <div class="snowBox" id="snowBackend" data-snow="snowBackend" aria-hidden="true"></div>
 
-<div class="card settingsCard settingsPhoto">
+          <div class="field">
+            <label>เลือกปลายทาง (Preset)</label>
+            <select id="backendSelect">
+              <option value="https://ooo-taen.onrender.com">https://ooo-taen.onrender.com</option>
+              <option value="http://localhost:8000">Local · http://localhost:8000</option>
+            </select>
+          </div>
 
-  <div class="settingsGrid">
-    <div class="settingsGroup">
-      <div class="settingsLabelRow">
-        <label>บริษัท (เลือกได้หลายอัน) · ไม่เลือก = ทุกบริษัท</label>
+          <div class="field">
+            <label>เชื่อมต่อ API (แก้ไขเองได้)</label>
+            <input id="backendUrl" placeholder="https://ooo-taen.onrender.com" />
+          </div>
+        </div>
+      </details>
+
+      <!-- ✅ Optional: แสดงรายละเอียด pre-filter (ถ้าคุณเรียก showFilterDetails(details)) -->
+      <div id="filterDetails" style="display:none"></div>
+
+      <!-- ✅ Settings / Pre-upload filters -->
+      <div class="card settingsCard settingsPhoto">
+        <div class="settingsGrid">
+          <div class="settingsGroup">
+            <div class="settingsLabelRow">
+              <label>บริษัท (เลือกได้หลายอัน) · ไม่เลือก = ทุกบริษัท</label>
+            </div>
+
+            <div class="chipRow chipsBig" id="clientChips">
+              <button type="button" class="chip" data-client="SHD">SHD</button>
+              <button type="button" class="chip" data-client="TOPONE">TOPONE</button>
+              <button type="button" class="chip" data-client="RABBIT">RABBIT</button>
+              <button type="button" class="chip" data-client="HASHTAG">HASHTAG</button>
+              <button type="button" class="chip ghost" id="btnClientAll">All</button>
+              <button type="button" class="chip ghost" id="btnClientClear">Clear</button>
+            </div>
+          </div>
+
+          <div class="settingsDivider"></div>
+
+          <div class="settingsGroup">
+            <div class="settingsLabelRow">
+              <label>Platform (เลือกได้หลายอัน) · ไม่เลือก = ทุกแพลตฟอร์ม</label>
+            </div>
+
+            <div class="chipRow chipsBig" id="platformChips">
+              <button type="button" class="chip" data-platform="SHOPEE">SHOPEE</button>
+              <button type="button" class="chip" data-platform="LAZADA">LAZADA</button>
+              <button type="button" class="chip" data-platform="TIKTOK">TIKTOK</button>
+              <button type="button" class="chip" data-platform="SPX">SPX</button>
+              <button type="button" class="chip" data-platform="FACEBOOK">FACEBOOK</button>
+              <button type="button" class="chip" data-platform="OTHER">OTHER</button>
+              <button type="button" class="chip ghost" id="btnPlatformAll">All</button>
+              <button type="button" class="chip ghost" id="btnPlatformClear">Clear</button>
+            </div>
+          </div>
+
+          <div class="settingsDivider"></div>
+
+          <!-- ✅ NEW: WHT toggle (compute_wht) -->
+          <div class="settingsGroup">
+            <div class="settingsLabelRow">
+              <label>ภาษีหัก ณ ที่จ่าย (WHT)</label>
+            </div>
+            <label class="switchRow">
+              <input id="computeWht" type="checkbox" checked />
+              <span class="switchUI"></span>
+              <span class="muted small">
+                ✅ ภาษีหัก ณ ที่จ่าย = คำนวณภาษี · ❌ ปิด = ไม่คำนวณ (ไม่เติม P_wht / S_pnd)
+              </span>
+            </label>
+          </div>
+
+          <!-- ✅ Optional: strict mode toggle (ถ้าต้องการจริง ๆ)
+          <div class="settingsDivider"></div>
+          <div class="settingsGroup">
+            <div class="settingsLabelRow">
+              <label>Strict mode (ไฟล์เดาไม่ได้ = ข้าม)</label>
+            </div>
+            <label class="switchRow">
+              <input id="strictMode" type="checkbox" />
+              <span class="switchUI"></span>
+              <span class="muted small">เปิดแล้วจะ “ข้าม” ไฟล์ที่เดา client/platform ไม่ได้</span>
+            </label>
+          </div>
+          -->
+        </div>
       </div>
-
-      <div class="chipRow chipsBig" id="clientChips">
-        <button type="button" class="chip" data-client="SHD">SHD</button>
-        <button type="button" class="chip" data-client="TOPONE">TOPONE</button>
-        <button type="button" class="chip" data-client="RABBIT">RABBIT</button>
-        <button type="button" class="chip" data-client="HASHTAG">HASHTAG</button>
-        <button type="button" class="chip ghost" id="btnClientAll">All</button>
-        <button type="button" class="chip ghost" id="btnClientClear">Clear</button>
-      </div>
-    </div>
-
-    <div class="settingsDivider"></div>
-
-    <div class="settingsGroup">
-      <div class="settingsLabelRow">
-        <label>Platform (เลือกได้หลายอัน) · ไม่เลือก = ทุกแพลตฟอร์ม</label>
-      </div>
-
-      <div class="chipRow chipsBig" id="platformChips">
-        <button type="button" class="chip" data-platform="SHOPEE">SHOPEE</button>
-        <button type="button" class="chip" data-platform="LAZADA">LAZADA</button>
-        <button type="button" class="chip" data-platform="TIKTOK">TIKTOK</button>
-        <button type="button" class="chip" data-platform="SPX">SPX</button>
-        <button type="button" class="chip" data-platform="FACEBOOK">FACEBOOK</button>
-        <button type="button" class="chip" data-platform="OTHER">OTHER</button>
-        <button type="button" class="chip ghost" id="btnPlatformAll">All</button>
-        <button type="button" class="chip ghost" id="btnPlatformClear">Clear</button>
-      </div>
-    </div>
-  </div>
-</div>
 
       <div class="card">
         <div class="h">1) Upload Files</div>
@@ -123,7 +154,6 @@
       <div class="card">
         <div class="h">2) Realtime Progress</div>
 
-        <!-- ✅ NEW layout: ring centered + KPI in one column (each on its own row) -->
         <div class="progressWrapV2">
           <div class="ringBlock">
             <div class="ring" id="ring" style="--p:0">
@@ -191,10 +221,22 @@
 
     <main class="main">
       <div class="topbar">
-        <div>
-          <div class="pageTitle">ผลลัพธ์ (PEAK Import)</div>
-          <div class="muted small">Filter + Search + Export CSV/XLSX · แก้ไขได้</div>
+        <!-- ✅ sky decor layer (clouds + sun + birds + underline) -->
+        <div class="skyDecor" aria-hidden="true">
+          <div class="sun"></div>
+
+          <div class="cloud c1"></div>
+          <div class="cloud c2"></div>
+          <div class="cloud c3"></div>
+
+          <div class="bird f1"></div>
+          <div class="bird f2"></div>
+          <div class="bird f3"></div>
+          <div class="bird f4"></div>
+          <div class="bird f5"></div>
         </div>
+
+        <div></div>
 
         <div class="actions">
           <button id="btnEdit" class="btn">แก้ไข</button>
@@ -222,12 +264,18 @@
           </div>
         </div>
 
-        <!-- ✅ table area -->
         <div class="tableWrap" id="tableWrap">
           <table class="excel" id="resultTable">
             <thead id="thead"></thead>
             <tbody id="tbody"></tbody>
           </table>
+        </div>
+
+        <!-- ✅ Horizontal scroll dock (ต้องมีให้ bindHScrollSync() ทำงาน) -->
+        <div class="hScrollDock" id="hScrollDock" style="display:none">
+          <div class="hScrollBar" id="hScrollBar">
+            <div class="hScrollInner" id="hScrollInner"></div>
+          </div>
         </div>
 
         <div class="hintbar small muted">
@@ -264,7 +312,7 @@
 
   <script src="./app.js"></script>
 
-  <!-- ✅ Snow bootstrap: ทำให้ตกชัวร์แม้ app.js ยังไม่ได้ใส่ -->
+  <!-- ✅ Snow bootstrap: เฉพาะตอนเปิด Backend URL แล้วค่อยสร้างหิมะ -->
   <script>
     (function(){
       function createSnowflakes(containerId, snowflakeCount){
@@ -288,21 +336,39 @@
           const opacity = 0.25 + Math.random() * 0.35;
           const topStart = -18 - Math.random() * 40;
 
-          snowflake.style.left = `${left}%`;
-          snowflake.style.top = `${topStart}px`;
-          snowflake.style.animationDelay = `${delay}s`;
-          snowflake.style.animationDuration = `${duration}s`;
-          snowflake.style.setProperty("--drift", `${drift}px`);
-          snowflake.style.fontSize = `${size}px`;
-          snowflake.style.opacity = `${opacity}`;
+          snowflake.style.left = left + "%";
+          snowflake.style.top = topStart + "px";
+          snowflake.style.animationDelay = delay + "s";
+          snowflake.style.animationDuration = duration + "s";
+          snowflake.style.setProperty("--drift", drift + "px");
+          snowflake.style.fontSize = size + "px";
+          snowflake.style.opacity = String(opacity);
 
           snowContainer.appendChild(snowflake);
         }
       }
 
-      window.addEventListener("load", function(){
-        createSnowflakes("snowBackend", 20);
-      });
+      // ✅ create only when the details is opened (prevents hidden render + keeps clean)
+      function wireBackendSnow(){
+        const d = document.getElementById("backendDrop");
+        if(!d) return;
+
+        let made = false;
+        d.addEventListener("toggle", function(){
+          if(d.open && !made){
+            made = true;
+            createSnowflakes("snowBackend", 20);
+          }
+        });
+
+        // optional: if it loads already open
+        if(d.open && !made){
+          made = true;
+          createSnowflakes("snowBackend", 20);
+        }
+      }
+
+      window.addEventListener("load", wireBackendSnow);
     })();
   </script>
 </body>

@@ -1,0 +1,9 @@
+This is likely a Google Ads/AdWords payment or invoice.
+Extract fields for PEAK when possible.
+Rules:
+- Do NOT guess shop/brand name; if missing, leave empty.
+- Prefer Payment number / Invoice number / Card method if present.
+Return JSON patch for PEAK fields only.
+
+TEXT:
+{{TEXT}}

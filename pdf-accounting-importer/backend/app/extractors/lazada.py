@@ -1,32 +1,39 @@
 # backend/app/extractors/lazada.py
 """
-Lazada extractor - PEAK A-U format (Enhanced v3.2 FIXED)
+Lazada extractor - PEAK A-U format (HARDENED, filename+client_tax_id + post-process)
 
-Fix goals (same class of bugs as TikTok/SPX):
+Fix goals (same class of bugs as TikTok/SPX/Shopee):
   ✅ NEVER let WHT amount overwrite unit_price / paid_amount
   ✅ Separate amounts clearly:
      - total_ex_vat
      - vat_amount
      - total_inc_vat  (PRIMARY)
-     - wht_amount_3pct
-  ✅ Mapping (per your strict rule):
+     - wht_amount_3pct (internal detection only when policy says P_wht blank)
+  ✅ Mapping (strict rule):
      row["N_unit_price"]  = total_inc_vat
      row["R_paid_amount"] = total_inc_vat
      row["O_vat_rate"]    = "7%"
-  ✅ Use "Total (Including Tax)" as primary (from Lazada totals block)
-  ✅ Fallbacks must avoid "wht_amount" being mistaken as totals
+  ✅ Prefer totals block lines:
+       Total
+       7% (VAT)
+       Total (Including Tax)
+  ✅ Reference/invoice must have NO spaces even across lines
+  ✅ T_note MUST be empty
+  ✅ Must be resilient on unknown templates / OCR noise / multi-page text
 
-IMPORTANT POLICY (your requirement):
-  - P_wht is often blank in your output. If you want it ALWAYS blank, keep WHT_MODE="EMPTY"
-  - If later you want "P_wht = 3% when WHT exists", set WHT_MODE="RATE"
-  - T_note MUST stay empty (per your pipeline)
-  - C_reference and G_invoice_no must have NO spaces even across lines (join tokens)
+Plan alignment:
+  1) ✅ extractor accepts (text, client_tax_id, filename)
+  2) ✅ enforce C/G from filename at end (if filename has ref)
+  3) ✅ call post-process (optional) for:
+        - K_account mapping
+        - description template
+        - any other global rules
 """
 
 from __future__ import annotations
 
 import re
-from typing import Dict, Any, Tuple, List, Optional
+from typing import Dict, Any, Tuple, Optional
 
 from .common import (
     base_row_dict,
@@ -37,17 +44,28 @@ from .common import (
     find_best_date,
     parse_date_to_yyyymmdd,
     extract_amounts,          # fallback only
-    extract_seller_info,      # fallback only
     format_peak_row,
     parse_money,
 )
 
 # ========================================
-# POLICY FLAGS (สำคัญ)
+# POLICY FLAGS
 # ========================================
-# "EMPTY" = P_wht always "0" (blank policy)
-# "RATE"  = P_wht "3%" if WHT exists else "0"
+# "EMPTY" = P_wht always "" (blank policy)  ✅ recommended
+# "RATE"  = P_wht "3%" if WHT exists else ""
 WHT_MODE = "EMPTY"
+
+# ========================================
+# Optional post-process hook
+# ========================================
+# You may already have a module like:
+#   backend/app/extractors/post_process.py
+# with a function:
+#   post_process_peak_row(row, platform, filename, client_tax_id, text)
+try:
+    from .post_process import post_process_peak_row  # type: ignore
+except Exception:  # pragma: no cover
+    post_process_peak_row = None  # type: ignore
 
 # ========================================
 # Import vendor mapping (with fallback)
@@ -56,51 +74,40 @@ try:
     from .vendor_mapping import (
         get_vendor_code,
         VENDOR_LAZADA,
-        VENDOR_NAME_MAP,
     )
     VENDOR_MAPPING_AVAILABLE = True
-except ImportError:
+except Exception:  # pragma: no cover
     VENDOR_MAPPING_AVAILABLE = False
-    VENDOR_LAZADA = "0105555040244"  # Lazada Tax ID
-    VENDOR_NAME_MAP = {}             # safe fallback
+    get_vendor_code = None  # type: ignore
+    VENDOR_LAZADA = "0105555040244"  # Lazada Tax ID (vendor)
 
 
 # ============================================================
-# Lazada-specific patterns (matched to sample PDF)
+# Lazada-specific patterns (hardened)
 # ============================================================
-
-RE_LAZADA_SELLER_CODE_TH = re.compile(r"\b(TH[A-Z0-9]{8,12})\b")
-RE_LAZADA_DOC_THMPTI = re.compile(r"\b(THMPTI\d{16})\b", re.IGNORECASE)
-
-RE_LAZADA_INVOICE_NO_FIELD = re.compile(
-    r"Invoice\s*No\.?\s*[:#：]?\s*([A-Z0-9\-/]{8,40})",
-    re.IGNORECASE
-)
-
-RE_LAZADA_INVOICE_DATE = re.compile(
-    r"Invoice\s*Date\s*[:#：]?\s*(\d{4}[-/\.]\d{1,2}[-/\.]\d{1,2})",
-    re.IGNORECASE
-)
-
-RE_LAZADA_PERIOD = re.compile(
-    r"Period\s*[:#：]?\s*(\d{4}[-/\.]\d{1,2}[-/\.]\d{1,2})\s*[-–]\s*(\d{4}[-/\.]\d{1,2}[-/\.]\d{1,2})",
-    re.IGNORECASE
-)
 
 RE_TAX_ID_13 = re.compile(r"\b(\d{13})\b")
 
-RE_LAZADA_FEE_LINE = re.compile(
-    r"^\s*(\d+)\s+(.{3,120}?)\s+([0-9,]+(?:\.[0-9]{1,2})?)\s*$",
-    re.MULTILINE
+# invoice no
+RE_LAZADA_INVOICE_NO_FIELD = re.compile(
+    r"(?:Invoice\s*No\.?|Invoice\s*Number|Tax\s*Invoice\s*No\.?)\s*[:#：]?\s*([A-Z0-9\-/]{8,60})",
+    re.IGNORECASE,
+)
+RE_LAZADA_DOC_THMPTI = re.compile(r"\b(THMPTI\d{16,})\b", re.IGNORECASE)
+
+# date
+RE_LAZADA_INVOICE_DATE = re.compile(
+    r"(?:Invoice\s*Date|Document\s*Date|Issue\s*Date)\s*[:#：]?\s*(\d{4}[-/\.]\d{1,2}[-/\.]\d{1,2})",
+    re.IGNORECASE,
 )
 
-# Totals block (STRICT, best source)
+# Totals block (STRICT)
 RE_LAZADA_SUBTOTAL_TOTAL = re.compile(
     r"^\s*Total\s+([0-9,]+\.[0-9]{2})\s*$",
     re.MULTILINE | re.IGNORECASE
 )
 RE_LAZADA_VAT_7 = re.compile(
-    r"^\s*7%\s*\(VAT\)\s+([0-9,]+\.[0-9]{2})\s*$",
+    r"^\s*(?:7%\s*\(VAT\)|VAT\s*7%|7%\s*VAT)\s+([0-9,]+\.[0-9]{2})\s*$",
     re.MULTILINE | re.IGNORECASE
 )
 RE_LAZADA_TOTAL_INC = re.compile(
@@ -108,20 +115,31 @@ RE_LAZADA_TOTAL_INC = re.compile(
     re.MULTILINE | re.IGNORECASE
 )
 
-RE_LAZADA_WHT_TEXT = re.compile(
-    r"หักภาษีณ?\s*ที่จ่าย.*?อัตรา(?:ร้อยละ)?\s*(\d+)\s*%.*?เป็นจำนวน\s*([0-9,]+(?:\.[0-9]{2})?)\s*บาท",
-    re.IGNORECASE | re.DOTALL
+# Inline totals fallback
+RE_LAZADA_TOTAL_INC_INLINE = re.compile(
+    r"(?:Total\s*\(Including\s*Tax\)|Grand\s*Total|Amount\s*Due)\s*[:#：]?\s*([0-9,]+(?:\.[0-9]{2})?)",
+    re.IGNORECASE
 )
-
-RE_LAZADA_FEE_KEYWORDS = re.compile(
-    r"(?:Payment\s*Fee|Commission|Premium\s*Package|LazCoins|Sponsored|Voucher|Marketing|Service|Discovery|Participation|Funded)",
+RE_LAZADA_SUBTOTAL_INLINE = re.compile(
+    r"(?:Subtotal|Total\s*excluding\s*VAT|Total\s*\(Excluding\s*Tax\))\s*[:#：]?\s*([0-9,]+(?:\.[0-9]{2})?)",
+    re.IGNORECASE
+)
+RE_LAZADA_VAT_INLINE = re.compile(
+    r"(?:VAT|ภาษีมูลค่าเพิ่ม)\s*(?:7%|@?\s*7%)?\s*[:#：]?\s*([0-9,]+(?:\.[0-9]{2})?)",
     re.IGNORECASE
 )
 
-# --- Reference join patterns (สำคัญมาก) ---
-# ตัวอย่างที่คุณให้: RCSPXSPB00-00000-25 1218-0001593  (อาจมาคนละบรรทัด)
-RE_DOCNO_GENERIC = re.compile(r"\b([A-Z0-9]{6,20}-\d{5}-\d{2})\b", re.IGNORECASE)
-RE_MMDD_SEQ = re.compile(r"\b(\d{4})\s*-\s*(\d{7})\b")
+# WHT (detection only)
+RE_LAZADA_WHT_TEXT = re.compile(
+    r"หักภาษีณ?\s*ที่จ่าย.*?อัตรา(?:ร้อยละ)?\s*(\d{1,2})\s*%.*?(?:เป็นจำนวน|จำนวน)\s*([0-9,]+(?:\.[0-9]{2})?)\s*บาท",
+    re.IGNORECASE | re.DOTALL
+)
+RE_LAZADA_WHT_EN = re.compile(
+    r"(?:withholding|withheld)\s+tax.*?(\d{1,2})\s*%.*?(?:amounting\s*to|at|=)\s*([0-9,]+(?:\.[0-9]{2})?)",
+    re.IGNORECASE | re.DOTALL
+)
+
+RE_ALL_WS = re.compile(r"\s+")
 
 
 # ============================================================
@@ -129,176 +147,10 @@ RE_MMDD_SEQ = re.compile(r"\b(\d{4})\s*-\s*(\d{7})\b")
 # ============================================================
 
 def _safe_money(v: str) -> str:
-    """Return normalized money '1234.56' or ''."""
     try:
-        return parse_money(v)
+        return parse_money(v) or ""
     except Exception:
         return ""
-
-
-def _pick_client_tax_id(text: str) -> str:
-    t = normalize_text(text)
-    for m in RE_TAX_ID_13.finditer(t):
-        tax = m.group(1)
-        if tax and tax != VENDOR_LAZADA:
-            return tax
-    return ""
-
-
-def _squash_spaces_and_newlines(s: str) -> str:
-    """
-    Remove ALL whitespace to prevent 'RC... 1218-...' becoming split.
-    Very important for C_reference / G_invoice_no.
-    """
-    if not s:
-        return ""
-    return re.sub(r"\s+", "", s)
-
-
-def _build_full_reference_no_space(text: str) -> str:
-    """
-    Build reference like:
-      DOCNO + MMDD-XXXXXXX
-    WITHOUT any spaces, even if OCR splits into multiple lines.
-
-    Example:
-      RCSPXSPB00-00000-25
-      1218-0001593
-    -> RCSPXSPB00-00000-251218-0001593
-    """
-    t0 = normalize_text(text or "")
-    t = _squash_spaces_and_newlines(t0)
-
-    m_doc = RE_DOCNO_GENERIC.search(t)
-    m_ref = RE_MMDD_SEQ.search(t)
-
-    if m_doc and m_ref:
-        return f"{m_doc.group(1)}{m_ref.group(1)}-{m_ref.group(2)}"
-
-    # fallback: if only invoice_no exists (THMPTI...)
-    m_thmpti = RE_LAZADA_DOC_THMPTI.search(t)
-    if m_thmpti:
-        return m_thmpti.group(1)
-
-    # fallback: invoice field (keep also squashed)
-    m_inv = RE_LAZADA_INVOICE_NO_FIELD.search(t0)
-    if m_inv:
-        return _squash_spaces_and_newlines(m_inv.group(1).strip())
-
-    return ""
-
-
-def extract_seller_code_lazada(text: str) -> str:
-    t = normalize_text(text)
-
-    candidates = []
-    for m in RE_LAZADA_SELLER_CODE_TH.finditer(t):
-        code = m.group(1)
-        if not code.upper().startswith("THMPTI"):
-            candidates.append(code)
-    if candidates:
-        return candidates[0]
-
-    info = extract_seller_info(t)
-    if info.get("seller_code"):
-        sc = str(info["seller_code"]).strip()
-        if sc and not sc.upper().startswith("THMPTI"):
-            return sc
-
-    return ""
-
-
-def extract_lazada_fee_summary(text: str, max_items: int = 10) -> Tuple[str, str, List[Dict[str, str]]]:
-    """
-    NOTE: kept from your version. Used only for optional notes (but we keep T_note empty by policy).
-    """
-    t = normalize_text(text)
-
-    fee_items: List[str] = []
-    fee_details: List[str] = []
-    fee_list: List[Dict[str, str]] = []
-
-    for m in RE_LAZADA_FEE_LINE.finditer(t):
-        no = m.group(1)
-        desc = m.group(2).strip()
-        amt_raw = m.group(3)
-
-        desc_l = desc.lower()
-
-        # skip totals-ish
-        if desc_l.startswith("total"):
-            continue
-        if "including tax" in desc_l or "vat" in desc_l or "tax" in desc_l or "ภาษี" in desc_l:
-            continue
-
-        if not RE_LAZADA_FEE_KEYWORDS.search(desc):
-            continue
-
-        amt = parse_money(amt_raw)
-        if not amt or amt in ("0", "0.00"):
-            continue
-
-        name = re.sub(r"\s{2,}", " ", desc).strip()
-        if len(name) > 90:
-            name = name[:90].rstrip()
-
-        fee_items.append(name)
-        fee_details.append(f"{no}. {name}: ฿{amt}")
-        fee_list.append({"no": no, "name": name, "amount": amt})
-
-        if len(fee_items) >= max_items:
-            break
-
-    if not fee_items:
-        return ("", "", [])
-
-    short = "Lazada Fees: " + ", ".join(fee_items[:3])
-    if len(fee_items) > 3:
-        short += f" (+{len(fee_items) - 3} more)"
-
-    notes = "\n".join(fee_details)
-    return (short, notes, fee_list)
-
-
-def extract_wht_from_text(text: str) -> Tuple[str, str]:
-    """
-    Returns (rate, amount) like ("3%", "3219.71")
-    STRICT: we extract but we will not let it pollute totals.
-    """
-    t = normalize_text(text)
-    m = RE_LAZADA_WHT_TEXT.search(t)
-    if not m:
-        return ("", "")
-    rate = f"{m.group(1)}%"
-    amt = parse_money(m.group(2)) or ""
-    return (rate, amt)
-
-
-def extract_totals_block(text: str) -> Tuple[str, str, str]:
-    """
-    Extract (total_ex_vat, vat_amount, total_inc_vat) from totals area.
-    PRIMARY and safest source.
-    """
-    t = normalize_text(text)
-
-    total_ex_vat = ""
-    vat_amount = ""
-    total_inc_vat = ""
-
-    m = RE_LAZADA_SUBTOTAL_TOTAL.search(t)
-    if m:
-        total_ex_vat = parse_money(m.group(1)) or ""
-
-    m = RE_LAZADA_VAT_7.search(t)
-    if m:
-        vat_amount = parse_money(m.group(1)) or ""
-
-    m = RE_LAZADA_TOTAL_INC.search(t)
-    if m:
-        total_inc_vat = parse_money(m.group(1)) or ""
-
-    return (total_ex_vat, vat_amount, total_inc_vat)
-
 
 def _safe_float(x: str) -> float:
     try:
@@ -306,6 +158,106 @@ def _safe_float(x: str) -> float:
     except Exception:
         return 0.0
 
+def _squash_ws(s: str) -> str:
+    """Remove ALL whitespace (space/tab/newline)."""
+    if not s:
+        return ""
+    return RE_ALL_WS.sub("", s)
+
+def _digits_only(s: str) -> str:
+    return "".join(ch for ch in str(s or "") if ch.isdigit())
+
+def _pick_client_tax_id(text: str) -> str:
+    """
+    Best-effort: pick a 13-digit tax id that is NOT vendor tax id.
+    """
+    t = normalize_text(text or "")
+    for m in RE_TAX_ID_13.finditer(t):
+        tax = m.group(1)
+        if tax and tax != VENDOR_LAZADA:
+            return tax
+    return ""
+
+def _get_vendor_code_safe(client_tax_id: str, vendor_tax_id: str) -> str:
+    """
+    Prefer vendor_mapping.get_vendor_code if available; otherwise fallback label 'Lazada'.
+    Must never raise.
+    """
+    if VENDOR_MAPPING_AVAILABLE and client_tax_id and callable(get_vendor_code):
+        try:
+            code = get_vendor_code(
+                client_tax_id=client_tax_id,
+                vendor_tax_id=vendor_tax_id,
+                vendor_name="Lazada",
+            )
+            # accept only Cxxxxx as vendor code; else fallback "Lazada"
+            if isinstance(code, str) and re.match(r"^C\d{5}$", code.strip(), re.IGNORECASE):
+                return code.strip().upper()
+            return "Lazada"
+        except Exception:
+            return "Lazada"
+    return "Lazada"
+
+def extract_wht_from_text(text: str) -> Tuple[str, str]:
+    """Returns (rate, amount) like ('3%', '3219.71') - detection only."""
+    t = normalize_text(text or "")
+
+    m = RE_LAZADA_WHT_TEXT.search(t)
+    if m:
+        rate = f"{(m.group(1) or '').strip()}%"
+        amt = _safe_money(m.group(2))
+        return (rate, amt)
+
+    m2 = RE_LAZADA_WHT_EN.search(t)
+    if m2:
+        rate = f"{(m2.group(1) or '').strip()}%"
+        amt = _safe_money(m2.group(2))
+        return (rate, amt)
+
+    return ("", "")
+
+def extract_totals_block(text: str) -> Tuple[str, str, str]:
+    """
+    Extract (total_ex_vat, vat_amount, total_inc_vat)
+    - Strongest: totals block lines (multiline exact)
+    - Fallback: inline forms
+    """
+    t = normalize_text(text or "")
+
+    total_ex_vat = ""
+    vat_amount = ""
+    total_inc_vat = ""
+
+    # strict multiline (best)
+    m = RE_LAZADA_SUBTOTAL_TOTAL.search(t)
+    if m:
+        total_ex_vat = _safe_money(m.group(1))
+
+    m = RE_LAZADA_VAT_7.search(t)
+    if m:
+        vat_amount = _safe_money(m.group(1))
+
+    m = RE_LAZADA_TOTAL_INC.search(t)
+    if m:
+        total_inc_vat = _safe_money(m.group(1))
+
+    # inline fallback
+    if not total_inc_vat:
+        m = RE_LAZADA_TOTAL_INC_INLINE.search(t)
+        if m:
+            total_inc_vat = _safe_money(m.group(1))
+
+    if not total_ex_vat:
+        m = RE_LAZADA_SUBTOTAL_INLINE.search(t)
+        if m:
+            total_ex_vat = _safe_money(m.group(1))
+
+    if not vat_amount:
+        m = RE_LAZADA_VAT_INLINE.search(t)
+        if m:
+            vat_amount = _safe_money(m.group(1))
+
+    return (total_ex_vat, vat_amount, total_inc_vat)
 
 def _derive_total_inc_vat(total_ex_vat: str, vat_amount: str) -> str:
     if not total_ex_vat or not vat_amount:
@@ -315,6 +267,52 @@ def _derive_total_inc_vat(total_ex_vat: str, vat_amount: str) -> str:
         return ""
     return f"{v:.2f}"
 
+def _build_reference_no_space(text: str, filename: str = "") -> str:
+    """
+    Lazada primary reference = THMPTI... token or Invoice No field.
+    MUST have NO spaces/newlines (squash).
+    """
+    t = normalize_text(text or "")
+    fn = normalize_text(filename or "")
+
+    # 1) THMPTI token anywhere (squashed)
+    m = RE_LAZADA_DOC_THMPTI.search(_squash_ws(t))
+    if m:
+        return _squash_ws(m.group(1))
+
+    # 2) Invoice No field
+    m = RE_LAZADA_INVOICE_NO_FIELD.search(t)
+    if m:
+        return _squash_ws(m.group(1).strip())
+
+    # 3) filename fallback
+    m = RE_LAZADA_DOC_THMPTI.search(_squash_ws(fn))
+    if m:
+        return _squash_ws(m.group(1))
+
+    m = RE_LAZADA_INVOICE_NO_FIELD.search(fn)
+    if m:
+        return _squash_ws(m.group(1).strip())
+
+    # 4) common finder fallback
+    inv = find_invoice_no(t, "Lazada") or ""
+    if inv:
+        return _squash_ws(inv)
+
+    return ""
+
+def _enforce_ref_from_filename(row: Dict[str, Any], filename: str) -> None:
+    """
+    Plan C: enforce C/G from filename at the end.
+    If filename contains THMPTI... or an invoice token, overwrite C_reference & G_invoice_no.
+    """
+    if not filename:
+        return
+    ref = _build_reference_no_space("", filename=filename)
+    if ref:
+        row["C_reference"] = ref
+        row["G_invoice_no"] = ref
+
 
 # ============================================================
 # Main
@@ -322,167 +320,212 @@ def _derive_total_inc_vat(total_ex_vat: str, vat_amount: str) -> str:
 
 def extract_lazada(text: str, client_tax_id: str = "", filename: str = "") -> Dict[str, Any]:
     """
-    FIXED mapping rule:
+    Strict mapping:
+      N_unit_price  = total_inc_vat
+      R_paid_amount = total_inc_vat
+      O_vat_rate    = "7%"
 
-    Separate:
-      total_ex_vat
-      vat_amount
-      total_inc_vat  (PRIMARY)
-      wht_amount_3pct
+    Guard rails:
+      - NEVER map WHT amount into totals
+      - P_wht policy:
+          WHT_MODE="EMPTY" -> always ""
+          WHT_MODE="RATE"  -> "3%" if WHT exists else ""
+      - C_reference / G_invoice_no must be identical & NO whitespace
+      - T_note must be empty
 
-    Mapping:
-      row["N_unit_price"]  = total_inc_vat
-      row["R_paid_amount"] = total_inc_vat
-      row["O_vat_rate"]    = "7%"
-      P_wht policy controlled by WHT_MODE:
-        - EMPTY: always "0"
-        - RATE: "3%" if WHT exists else "0"
-
-    Other:
-      - C_reference and G_invoice_no must be identical and NO SPACE
-      - T_note must remain empty
+    Plan assumptions:
+      - filename passed in from job_worker / extract_service
+      - post_process_peak_row() (if exists) will apply:
+          * K_account mapping
+          * description template
+          * any additional global rules
     """
-    t = normalize_text(text)
-    row = base_row_dict()
+    try:
+        t = normalize_text(text or "")
+        row = base_row_dict()
 
-    # --------------------------
-    # STEP 1: Vendor tax & code
-    # --------------------------
-    vendor_tax = find_vendor_tax_id(t, "Lazada")
-    row["E_tax_id_13"] = vendor_tax or VENDOR_LAZADA
+        # --------------------------
+        # STEP 1: Vendor tax & code
+        # --------------------------
+        vendor_tax = find_vendor_tax_id(t, "Lazada") or VENDOR_LAZADA
+        row["E_tax_id_13"] = vendor_tax
 
-    if not client_tax_id:
-        client_tax_id = _pick_client_tax_id(t)
+        # best-effort client tax id
+        if not client_tax_id:
+            client_tax_id = _pick_client_tax_id(t)
 
-    if VENDOR_MAPPING_AVAILABLE and client_tax_id:
-        try:
-            row["D_vendor_code"] = get_vendor_code(
-                client_tax_id=client_tax_id,
-                vendor_tax_id=row["E_tax_id_13"],
-                vendor_name="Lazada",
-            ) or "Lazada"
-        except Exception:
-            row["D_vendor_code"] = "Lazada"
-    else:
+        row["D_vendor_code"] = _get_vendor_code_safe(client_tax_id, vendor_tax)
+        row["F_branch_5"] = find_branch(t) or "00000"
+
+        # --------------------------
+        # STEP 2: Reference / Invoice No (NO SPACE)
+        # --------------------------
+        full_ref = _build_reference_no_space(t, filename=filename)
+        if full_ref:
+            row["G_invoice_no"] = full_ref
+            row["C_reference"] = full_ref
+
+        # --------------------------
+        # STEP 3: Date (invoice date first)
+        # --------------------------
+        doc_date = ""
+        m = RE_LAZADA_INVOICE_DATE.search(t)
+        if m:
+            doc_date = parse_date_to_yyyymmdd(m.group(1)) or ""
+        if not doc_date:
+            doc_date = find_best_date(t) or ""
+
+        if doc_date:
+            row["B_doc_date"] = doc_date
+            row["H_invoice_date"] = doc_date
+            row["I_tax_purchase_date"] = doc_date
+
+        # --------------------------
+        # STEP 4: Amounts (STRICT)
+        # --------------------------
+        total_ex_vat, vat_amount, total_inc_vat = extract_totals_block(t)
+
+        # derive inc vat if missing (ex + vat exists)
+        if not total_inc_vat:
+            derived = _derive_total_inc_vat(total_ex_vat, vat_amount)
+            if derived:
+                total_inc_vat = derived
+
+        # WHT detection (separate channel) - NEVER use as total
+        wht_rate, wht_amount_3pct = extract_wht_from_text(t)
+        has_wht_3 = (wht_rate == "3%" and bool(wht_amount_3pct))
+
+        # FINAL fallback: common extractor, but reject if equals WHT
+        if not total_inc_vat:
+            a = extract_amounts(t) or {}
+            cand_total = (a.get("total", "") or "").strip()
+            cand_wht = (a.get("wht_amount", "") or "").strip()
+
+            # never accept if it matches WHT
+            if cand_total and cand_total != cand_wht:
+                total_inc_vat = cand_total
+
+        # If still missing, fallback to subtotal (still NOT WHT)
+        if not total_inc_vat and total_ex_vat:
+            total_inc_vat = total_ex_vat
+
+        # --------------------------
+        # STEP 5: PEAK mapping (strict)
+        # --------------------------
+        row["M_qty"] = "1"
+        row["J_price_type"] = "1"
+        row["O_vat_rate"] = "7%"
+        row["Q_payment_method"] = "หักจากยอดขาย"
+
+        if total_inc_vat:
+            row["N_unit_price"] = total_inc_vat
+            row["R_paid_amount"] = total_inc_vat
+        else:
+            row["N_unit_price"] = row.get("N_unit_price") or "0"
+            row["R_paid_amount"] = row.get("R_paid_amount") or "0"
+
+        # --------------------------
+        # STEP 6: P_wht policy
+        # --------------------------
+        if WHT_MODE.upper() == "RATE":
+            row["P_wht"] = "3%" if has_wht_3 else ""
+            row["S_pnd"] = "53" if has_wht_3 else ""
+        else:
+            row["P_wht"] = ""   # ✅ blank policy
+            row["S_pnd"] = ""   # keep empty unless you explicitly want it
+
+        # --------------------------
+        # STEP 7: Base description/group (post-process may override)
+        # --------------------------
+        row["L_description"] = "Marketplace Expense"
+        row["U_group"] = "Marketplace Expense"
+
+        # Notes must be blank
+        row["T_note"] = ""
+
+        # K_account template (post-process is preferred)
+        row["K_account"] = ""
+
+        # --------------------------
+        # STEP 8: Safety sync + strict squash
+        # --------------------------
+        row["C_reference"] = _squash_ws(row.get("C_reference", ""))
+        row["G_invoice_no"] = _squash_ws(row.get("G_invoice_no", ""))
+
+        if not row.get("C_reference") and row.get("G_invoice_no"):
+            row["C_reference"] = row["G_invoice_no"]
+        if not row.get("G_invoice_no") and row.get("C_reference"):
+            row["G_invoice_no"] = row["C_reference"]
+
+        # --------------------------
+        # STEP 9: Plan C — enforce C/G from filename at end
+        # --------------------------
+        _enforce_ref_from_filename(row, filename=filename)
+
+        # after enforce: re-squash
+        row["C_reference"] = _squash_ws(row.get("C_reference", ""))
+        row["G_invoice_no"] = _squash_ws(row.get("G_invoice_no", ""))
+
+        # --------------------------
+        # STEP 10: Post-process (optional)
+        # --------------------------
+        if callable(post_process_peak_row):
+            try:
+                row = post_process_peak_row(
+                    row=row,
+                    platform="lazada",
+                    filename=filename or "",
+                    client_tax_id=_digits_only(client_tax_id) if client_tax_id else "",
+                    text=t,
+                ) or row
+            except Exception:
+                # must never crash extractor
+                pass
+
+        return format_peak_row(row)
+
+    except Exception:
+        # Fail-safe: never crash, stable output
+        row = base_row_dict()
         row["D_vendor_code"] = "Lazada"
-
-    br = find_branch(t)
-    row["F_branch_5"] = br if br else "00000"
-
-    # --------------------------
-    # STEP 2: Reference / Invoice No (NO SPACE)
-    # --------------------------
-    # Prefer your joined reference format (DOCNO + MMDD-XXXXXXX), fallback to find_invoice_no
-    full_ref = _build_full_reference_no_space(t)
-    if not full_ref:
-        inv = find_invoice_no(t, "Lazada")
-        full_ref = _squash_spaces_and_newlines(inv or "")
-
-    if full_ref:
-        row["G_invoice_no"] = full_ref
-        row["C_reference"] = full_ref
-
-    # --------------------------
-    # STEP 3: Date & Period
-    # --------------------------
-    doc_date = ""
-    m = RE_LAZADA_INVOICE_DATE.search(t)
-    if m:
-        doc_date = parse_date_to_yyyymmdd(m.group(1)) or ""
-
-    if not doc_date:
-        doc_date = find_best_date(t) or ""
-
-    if doc_date:
-        row["B_doc_date"] = doc_date
-        row["H_invoice_date"] = doc_date
-        row["I_tax_purchase_date"] = doc_date
-
-    # --------------------------
-    # STEP 4: Amounts (STRICT)
-    # --------------------------
-    total_ex_vat, vat_amount, total_inc_vat = extract_totals_block(t)
-
-    # Derive total_inc_vat if missing but ex+vat exist
-    if not total_inc_vat:
-        derived = _derive_total_inc_vat(total_ex_vat, vat_amount)
-        if derived:
-            total_inc_vat = derived
-
-    # Extract WHT (separate channel)
-    wht_rate, wht_amount_3pct = extract_wht_from_text(t)
-
-    # FINAL fallback for totals: use extract_amounts BUT NEVER allow wht_amount to become total
-    if not total_inc_vat:
-        a = extract_amounts(t)
-        cand_total = (a.get("total", "") or "").strip()
-        cand_wht = (a.get("wht_amount", "") or "").strip()
-
-        # reject if it equals WHT or looks too small compared to ex_vat (heuristic)
-        if cand_total and cand_total != cand_wht:
-            total_inc_vat = cand_total
-
-    # If still missing: fallback to total_ex_vat (still NOT WHT)
-    if not total_inc_vat and total_ex_vat:
-        total_inc_vat = total_ex_vat
-
-    # --------------------------
-    # STEP 5: PEAK mapping (strict)
-    # --------------------------
-    row["M_qty"] = "1"
-
-    # Primary rule: unit_price & paid_amount = total_inc_vat
-    if total_inc_vat:
-        row["N_unit_price"] = total_inc_vat
-        row["R_paid_amount"] = total_inc_vat
-    else:
-        # never use WHT here
-        row["N_unit_price"] = row.get("N_unit_price") or "0"
-        row["R_paid_amount"] = row.get("R_paid_amount") or "0"
-
-    row["J_price_type"] = "1"
-    row["O_vat_rate"] = "7%"
-    row["Q_payment_method"] = "หักจากยอดขาย"
-
-    # --------------------------
-    # STEP 6: P_wht policy
-    # --------------------------
-    has_wht_3 = (wht_rate == "3%" and bool(wht_amount_3pct))
-
-    if WHT_MODE.upper() == "RATE":
-        row["P_wht"] = "3%" if has_wht_3 else "0"
-        row["S_pnd"] = "53" if has_wht_3 else ""
-    else:
-        # EMPTY policy (your latest requirement)
-        row["P_wht"] = "0"
+        row["E_tax_id_13"] = VENDOR_LAZADA
+        row["F_branch_5"] = "00000"
+        row["M_qty"] = "1"
+        row["J_price_type"] = "1"
+        row["O_vat_rate"] = "7%"
+        row["P_wht"] = ""       # ✅ blank policy
         row["S_pnd"] = ""
+        row["N_unit_price"] = "0"
+        row["R_paid_amount"] = "0"
+        row["Q_payment_method"] = "หักจากยอดขาย"
+        row["U_group"] = "Marketplace Expense"
+        row["L_description"] = "Marketplace Expense"
+        row["T_note"] = ""
+        row["K_account"] = ""
 
-    # --------------------------
-    # STEP 7: Description / Group
-    # --------------------------
-    row["L_description"] = "Marketplace Expense"
-    row["U_group"] = "Marketplace Expense"
+        # enforce C/G from filename even in fail-safe
+        _enforce_ref_from_filename(row, filename=filename or "")
+        row["C_reference"] = _squash_ws(row.get("C_reference", ""))
+        row["G_invoice_no"] = _squash_ws(row.get("G_invoice_no", ""))
 
-    # --------------------------
-    # STEP 8: Notes must be blank (ตามระบบคุณ)
-    # --------------------------
-    row["T_note"] = ""
+        # post-process (optional)
+        if callable(post_process_peak_row):
+            try:
+                row = post_process_peak_row(
+                    row=row,
+                    platform="lazada",
+                    filename=filename or "",
+                    client_tax_id=_digits_only(client_tax_id) if client_tax_id else "",
+                    text=normalize_text(text or ""),
+                ) or row
+            except Exception:
+                pass
 
-    # Safety sync C/G
-    if not row.get("C_reference") and row.get("G_invoice_no"):
-        row["C_reference"] = row["G_invoice_no"]
-    if not row.get("G_invoice_no") and row.get("C_reference"):
-        row["G_invoice_no"] = row["C_reference"]
-
-    row["K_account"] = ""
-
-    return format_peak_row(row)
+        return format_peak_row(row)
 
 
 __all__ = [
     "extract_lazada",
-    "extract_seller_code_lazada",
-    "extract_lazada_fee_summary",
     "extract_wht_from_text",
     "extract_totals_block",
 ]
