@@ -90,7 +90,7 @@ PLATFORM_GROUPS = {
 PLATFORM_DESCRIPTIONS = {
     "META": "Meta Ads",
     "GOOGLE": "Google Ads",
-    "SHOPEE": "Shopee Marketplace",
+    "SHOPEE": "Shopee Marketplace Fee",
     "LAZADA": "Lazada Marketplace",
     "TIKTOK": "TikTok Shop",
     "SPX": "Shopee Express",
@@ -157,7 +157,7 @@ _INTERNAL_OK_PREFIXES = ("_",)
 _RE_ALL_WS = re.compile(r"\s+")
 
 # ============================================================
-# Reference normalizer (ตัด Shopee-TIV- ให้เหลือ TRS...)
+# Reference normalizer (ตัด Shopee-TIV- ให้เหลือ TRS... / SPX ให้เหลือ RCS...)
 # ============================================================
 
 RE_TRS_CORE = re.compile(r"(TRS[A-Z0-9\-_/.]{10,})", re.IGNORECASE)
@@ -195,6 +195,7 @@ def _normalize_reference_core(value: Any) -> str:
     Normalize reference/invoice ให้เป็นแกนเอกสารที่ถูกต้อง
     Example:
       "Shopee-TIV-TRSPEMKP00-00000-251203-0012589.pdf" -> "TRSPEMKP00-00000-251203-0012589"
+      "SPX Express-RCT-RCSPXSPR00-00000-251205-0000625.pdf" -> "RCSPXSPR00-00000-251205-0000625"
     """
     s = _compact_no_ws(value)
     if not s:
@@ -520,7 +521,7 @@ def lock_peak_columns(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ============================================================
-# ✅ WHT policy helpers (✅/❌ คำนวณภาษีหัก ณ ที่จ่าย)
+# ✅ WHT policy helpers (✅/❌ คำนวณภาษีหัก ณ ที่จ่าย)  ✅ FIXED
 # ============================================================
 
 def _to_float(v: Any) -> float:
@@ -584,16 +585,24 @@ def _truthy(v: Any) -> bool:
 
 def _apply_wht_policy(row: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any]:
     """
+    ✅ FIXED BEHAVIOR (ตามเคส Shopee/SPX ของคุณ):
+
+    - ถ้า enabled:
+        * คำนวณ P_wht จาก "ยอดรวม VAT" (gross) แบบ:  wht = gross/(1+vat) * rate
+        * แล้วเซ็ต R_paid_amount = gross - wht  (ยอดจ่ายจริงหลังหัก ณ ที่จ่าย)
+        * เซ็ต S_pnd = pnd_when_wht (default "53" หรือคุณจะตั้ง "1" ก็ได้)
+    - ถ้า disabled:
+        * ล้าง P_wht = ""
+        * ไม่แตะ R_paid_amount (ปล่อยตาม extractor)
+        * เซ็ต S_pnd = pnd_when_no_wht (default "53")
+
     cfg parameters:
-      - calculate_wht: True/False (หรือ "1"/"0")
+      - calculate_wht / wht_enabled: True/False
       - wht_rate: default 0.03
-      - pnd_when_wht: default "1"
+      - pnd_when_wht: default "53"
       - pnd_when_no_wht: default "53"
-      - wht_base_mode:
-          "paid_includes_vat" (default) => base = paid/(1+vat)
-          "paid_excludes_vat"            => base = paid
-    สูตรที่เข้ากับรูปคุณ:
-      WHT = paid * rate / (1 + vat)   (เมื่อ paid เป็นยอดรวม VAT)
+      - wht_gross_field: "R_paid_amount" (default) fallback "N_unit_price"
+      - wht_override_existing: "0"/"1" (default "0") ถ้า "1" จะเขียนทับ P_wht ที่มีอยู่
     """
     cfg = cfg or {}
     enabled = _truthy(cfg.get("calculate_wht", cfg.get("wht_enabled")))
@@ -602,32 +611,56 @@ def _apply_wht_policy(row: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any
     except Exception:
         rate_f = 0.03
 
-    pnd_when_wht = str(cfg.get("pnd_when_wht", "1")).strip() or "1"
+    pnd_when_wht = str(cfg.get("pnd_when_wht", "53")).strip() or "53"
     pnd_when_no = str(cfg.get("pnd_when_no_wht", "53")).strip() or "53"
-    base_mode = str(cfg.get("wht_base_mode", "paid_includes_vat")).strip().lower() or "paid_includes_vat"
+    gross_field = str(cfg.get("wht_gross_field", "R_paid_amount")).strip() or "R_paid_amount"
+    override_existing = _truthy(cfg.get("wht_override_existing", "0"))
 
     if not enabled:
         # ❌ ไม่คำนวณภาษีหัก ณ ที่จ่าย
-        # (ถ้าคุณอยาก "ไม่ล้าง" แล้วให้กรอกเอง: เปลี่ยนเป็น: row["P_wht"] = str(row.get("P_wht") or "").strip()
         row["P_wht"] = ""
         if not str(row.get("S_pnd") or "").strip():
             row["S_pnd"] = pnd_when_no
         return row
 
     # ✅ คำนวณภาษีหัก ณ ที่จ่าย
-    paid = _to_float(row.get("R_paid_amount"))
     vat = _parse_vat_rate(row.get("O_vat_rate"))
 
-    cur_wht = str(row.get("P_wht") or "").strip()
-    if (not cur_wht) and paid > 0:
-        if base_mode == "paid_excludes_vat":
-            base = paid
-        else:
-            base = paid / (1.0 + vat) if vat > 0 else paid
-        wht_amount = base * rate_f
+    # gross (ยอดรวม VAT) — ใช้ R_paid_amount เป็นหลัก, fallback N_unit_price
+    gross = _to_float(row.get(gross_field))
+    if gross <= 0:
+        gross = _to_float(row.get("R_paid_amount"))
+    if gross <= 0:
+        gross = _to_float(row.get("N_unit_price"))
+
+    # ถ้าไม่มี gross ก็จบ
+    if gross <= 0:
+        if not str(row.get("S_pnd") or "").strip():
+            row["S_pnd"] = pnd_when_wht
+        return row
+
+    cur_wht_s = str(row.get("P_wht") or "").strip()
+    cur_wht = _to_float(cur_wht_s)
+
+    # ตัดสินใจว่าจะคำนวณ/เขียนทับไหม
+    should_calc = override_existing or (not cur_wht_s) or (cur_wht <= 0)
+
+    if should_calc:
+        base_ex_vat = gross / (1.0 + vat) if vat > 0 else gross
+        wht_amount = base_ex_vat * rate_f
         if wht_amount < 0:
             wht_amount = 0.0
-        row["P_wht"] = _fmt_2(round(wht_amount, 2))
+        wht_amount = round(wht_amount + 1e-9, 2)  # กัน floating edge
+        row["P_wht"] = _fmt_2(wht_amount)
+    else:
+        # ใช้ค่าเดิมที่มีอยู่
+        wht_amount = cur_wht
+
+    # ✅ FIX: Paid = Gross - WHT (ยอดจ่ายจริงหลังหัก ณ ที่จ่าย)
+    net = gross - wht_amount
+    if net < 0:
+        net = 0.0
+    row["R_paid_amount"] = _fmt_2(round(net + 1e-9, 2))
 
     if not str(row.get("S_pnd") or "").strip():
         row["S_pnd"] = pnd_when_wht
@@ -844,9 +877,9 @@ def finalize_row(
     if not str(row.get("O_vat_rate") or "").strip():
         row["O_vat_rate"] = "NO" if p in ("META", "GOOGLE") else "7%"
 
-    # ✅ APPLY PARAM: calculate_wht (✅/❌)
-    # - ✅: เติม P_wht จาก R_paid_amount และ set S_pnd = cfg.pnd_when_wht (default "1")
-    # - ❌: ล้าง P_wht และ set S_pnd = cfg.pnd_when_no_wht (default "53")
+    # ✅ APPLY PARAM: calculate_wht (✅/❌)  ✅ FIXED
+    # - ✅: คำนวณ P_wht จาก gross/(1+vat)*rate และ set R_paid_amount = gross - wht
+    # - ❌: ล้าง P_wht และ set S_pnd ตาม cfg
     row = _apply_wht_policy(row, cfg)
 
     # lock schema
